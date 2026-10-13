@@ -15,7 +15,7 @@ every batch first and runs none of them if any batch fails to parse.
 It also refuses what it does not understand: an unknown argument, an
 abbreviated flag (--app is not --apply), a GO line with trailing junk, a GO
 inside a comment or string, a sqlcmd directive, and a script that touches
-PARSEONLY itself.
+PARSEONLY, NOEXEC, FMTONLY, SHOWPLAN_* or IMPLICIT_TRANSACTIONS itself.
 
     python sqldeploy.py --self-test
     python sqldeploy.py deploy.sql --split-only
@@ -23,7 +23,8 @@ PARSEONLY itself.
     python sqldeploy.py deploy.sql --server HOST --database DB --apply
 
 Windows authentication only (Trusted_Connection=yes). No password is read,
-stored or printed. The driver is pyodbc, imported only when a connection is
+stored or printed, and string literals in the script are masked in summaries.
+The driver is pyodbc, imported only when a connection is
 needed, so --split-only and --self-test need nothing installed.
 """
 import argparse
@@ -47,14 +48,29 @@ SUMMARY_WIDTH = 80
 DETAIL_WIDTH = 300
 COMMENTS_ONLY = "(comments only)"
 
+MAX_GO_COUNT = 10000    # a larger GO count is refused, not run that many times
+MASK = "***"
+
+# quoted: the batch holds a string literal. tran: it holds BEGIN TRANSACTION.
 Batch = collections.namedtuple(
-    "Batch", "index first_line last_line text empty summary repeat")
+    "Batch", "index first_line last_line text empty summary repeat quoted tran")
 
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 # GO as a word at the start of a line. GOTO, GO_1 and GO5 are not GO.
 _GO_RE = re.compile(r"^\s*GO(?![\w@#$])(.*)$", re.IGNORECASE)
-_GO_TAIL_RE = re.compile(r"^(?:\s+(\d+))?\s*(?:--.*)?$")
+_GO_TAIL_RE = re.compile(r"^(?:\s+([0-9]+))?\s*(?:--.*)?$")
 _PARSEONLY_RE = re.compile(r"\bPARSEONLY\b", re.IGNORECASE)
+# Settings that stop later batches from running while the server still says OK.
+# The Microsoft pages for each say statements are not executed (NOEXEC,
+# SHOWPLAN_*), only metadata comes back (FMTONLY), or a transaction stays open
+# (IMPLICIT_TRANSACTIONS).
+_MODE_RE = re.compile(
+    r"\bSET\s+(NOEXEC|FMTONLY|SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML|"
+    r"IMPLICIT_TRANSACTIONS)\b", re.IGNORECASE)
+_TRAN_RE = re.compile(r"\bBEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?\b",
+                      re.IGNORECASE)
+_QUOTED_DETAIL_RE = re.compile(r"'(?:[^']|'')*'")
+_FLAG_NAME_RE = re.compile(r"--[A-Za-z][A-Za-z0-9-]{0,39}\Z")
 _DIRECTIVE_RE = re.compile(r"^\s*:[A-Za-z]", re.MULTILINE)
 _UNSAFE_CHARS_RE = re.compile(r"[^\x20-\x7e]")
 _BAD_CONN_VALUE_RE = re.compile(r"[;{}\x00-\x1f]")
@@ -72,12 +88,21 @@ def one_line(text, width):
 
 
 def decode_sql(data):
-    """Decode script bytes. SSMS saves UTF-16 with a BOM; most editors save UTF-8."""
+    """Decode script bytes. SSMS saves UTF-16 with a BOM; most editors save UTF-8.
+
+    A NUL character is refused. UTF-16 without a BOM, and UTF-32, decode as
+    UTF-8 or UTF-16 into text full of NULs, which the driver may cut short.
+    """
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return data.decode("utf-16")
-    if data[:3] == b"\xef\xbb\xbf":
-        return data[3:].decode("utf-8")
-    return data.decode("utf-8")
+        text = data.decode("utf-16")
+    elif data[:3] == b"\xef\xbb\xbf":
+        text = data[3:].decode("utf-8")
+    else:
+        text = data.decode("utf-8")
+    if "\x00" in text:
+        raise ValueError("the script holds a NUL character; save it as "
+                         "UTF-8, or as UTF-16 with a byte-order mark")
+    return text
 
 
 def _scan_line(line, depth, quote):
@@ -128,21 +153,69 @@ def _scan_line(line, depth, quote):
     return "".join(out), depth, quote
 
 
+def _walk(text):
+    """Yield (char, quote, role) for every character of comment-free text.
+
+    quote is None, "'", '"' or "[" (the container). role is "code", "delim"
+    (an opening or closing quote) or "body". A doubled ]] inside a bracketed
+    name is an escape and stays in the body. A doubled quote closes and
+    reopens, which is the same text.
+    """
+    quote = None
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if quote is None:
+            if c in "'\"[":
+                quote = c
+                yield c, c, "delim"
+            else:
+                yield c, None, "code"
+        elif c == ("]" if quote == "[" else quote):
+            if quote == "[" and text[i + 1:i + 2] == "]":
+                yield c, quote, "body"
+                i += 1
+                yield text[i], quote, "body"
+            else:
+                yield c, quote, "delim"
+                quote = None
+        else:
+            yield c, quote, "body"
+        i += 1
+
+
 def _code_only(visible):
     """Blank string and identifier text, so a word inside a literal never matches."""
+    return "".join(c if role == "code" else " " for c, _, role in _walk(visible))
+
+
+def _mask_literals(visible):
+    """Replace the text of each string literal with ***, so a secret is not echoed.
+
+    Bracketed names stay: they are identifiers, not data.
+    """
     out = []
-    quote = None
-    for c in visible:
-        if quote:
-            out.append(" ")
-            if c == ("]" if quote == "[" else quote):
-                quote = None
-        elif c in "'\"[":
-            quote = c
-            out.append(" ")
-        else:
+    masked = False
+    for c, quote, role in _walk(visible):
+        if role != "body" or quote == "[":
             out.append(c)
+            masked = False
+        elif not masked:
+            out.append(MASK)
+            masked = True
     return "".join(out)
+
+
+def server_detail(exc, batch):
+    """One line of driver text. Quoted text is masked when the batch has a literal.
+
+    The server often repeats the token it stopped at, which can be a literal.
+    """
+    text = " ".join(str(exc).split())
+    if batch.quoted:
+        text = _QUOTED_DETAIL_RE.sub("'%s'" % MASK, text)
+    return one_line(text, DETAIL_WIDTH)
 
 
 def split_script(text):
@@ -166,21 +239,29 @@ def split_script(text):
         del vis[:]
         first = state["start"]
         if body.strip():
+            masked = _mask_literals(visible_text)
             summary = COMMENTS_ONLY
-            for one in visible_text.split("\n"):
+            for one in masked.split("\n"):
                 squeezed = one_line(one, SUMMARY_WIDTH)
                 if squeezed:
                     summary = squeezed
                     break
             empty = summary == COMMENTS_ONLY
             index = len(batches) + 1
-            batches.append(Batch(index, first, last_line, body, empty,
-                                 summary, repeat))
             code = _code_only(visible_text)
+            batches.append(Batch(index, first, last_line, body, empty,
+                                 summary, repeat, masked != visible_text,
+                                 bool(_TRAN_RE.search(code))))
             if _PARSEONLY_RE.search(code):
                 problems.append((first, "batch %d mentions PARSEONLY; the "
                                  "setting takes effect at parse time, so a "
                                  "script must not change it" % index))
+            mode = _MODE_RE.search(code)
+            if mode:
+                problems.append((first, "batch %d sets %s; that setting "
+                                 "stops later batches from running while the "
+                                 "server reports success, so a script must "
+                                 "not set it" % (index, mode.group(1).upper())))
             if _DIRECTIVE_RE.search(code):
                 problems.append((first, "batch %d has a sqlcmd directive "
                                  "(a line starting with a colon); this tool "
@@ -202,10 +283,13 @@ def split_script(text):
                 problems.append((number, "malformed GO line: only a count "
                                  "and a -- comment may follow GO"))
             elif tail.group(1):
-                repeat = int(tail.group(1))
-                if repeat < 1:
+                digits = tail.group(1)
+                # int() on thousands of digits raises on Python 3.11 and later
+                repeat = int(digits) if len(digits) < 10 else 0
+                if not 1 <= repeat <= MAX_GO_COUNT:
                     problems.append((number, "GO count must be a positive "
-                                     "integer"))
+                                     "integer no larger than %d" %
+                                     MAX_GO_COUNT))
                     repeat = 1
             flush(number - 1, repeat)
             continue
@@ -287,7 +371,7 @@ def parse_check(cur, err, batches):
             try:
                 cur.execute(b.text)
             except err as exc:
-                results.append((b, "error", one_line(exc, DETAIL_WIDTH)))
+                results.append((b, "error", server_detail(exc, b)))
             else:
                 results.append((b, "clean", ""))
     finally:
@@ -312,7 +396,7 @@ def run_batches(cur, err, batches):
                 while cur.nextset():
                     pass
             except err as exc:
-                return executed, (b, run, one_line(exc, DETAIL_WIDTH))
+                return executed, (b, run, server_detail(exc, b))
         executed += 1
     return executed, None
 
@@ -332,9 +416,32 @@ class UsageError(Exception):
     pass
 
 
+def _unknown_message(extra):
+    """Name the unknown flags. Never echo a value: it may be a password."""
+    names = []
+    hidden = 0
+    for item in extra:
+        name = item.split("=", 1)[0]
+        if _FLAG_NAME_RE.match(name):
+            names.append(name)
+        else:
+            hidden += 1
+    if hidden:
+        names.append("(%d more not shown, in case one is a secret)" % hidden)
+    return "unrecognized arguments: " + " ".join(names)
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
+        if "ignored explicit argument" in message:    # would echo the value
+            message = message.split(":", 1)[0] + " takes no value"
         raise UsageError(message)
+
+    def parse_args(self, argv=None):
+        args, extra = self.parse_known_args(argv)
+        if extra:
+            raise UsageError(_unknown_message(extra))
+        return args
 
 
 def _parser():
@@ -449,23 +556,50 @@ def main(argv=None, connect=None):
     return _apply(args, connect, batches)
 
 
+_CAUGHT = (Exception, KeyboardInterrupt)
+
+
+def _problem_text(exc):
+    return one_line(exc, DETAIL_WIDTH) or exc.__class__.__name__
+
+
+def _close(conn):
+    """Close, and report a failure to stderr. A close error must not hide the verdict."""
+    try:
+        conn.close()
+    except Exception as exc:
+        print("warning: closing the connection failed: %s" %
+              _problem_text(exc), file=sys.stderr)
+
+
 def _with_connection(connect, conn_string, work):
     """Open a connection, run work(cursor, Error), always close it.
 
     Returns (value, problem, opened). problem is None or one line of text. A
     driver raises its own classes, none of which is a base we can name before
-    pyodbc is imported, so every Exception is caught here.
+    pyodbc is imported, so every Exception is caught here, and Ctrl+C too.
     """
     try:
         conn, err = connect(conn_string)
-    except Exception as exc:
-        return None, one_line(exc, DETAIL_WIDTH), False
+    except _CAUGHT as exc:
+        return None, _problem_text(exc), False
     try:
         return work(conn.cursor(), err), None, True
-    except Exception as exc:
-        return None, one_line(exc, DETAIL_WIDTH), True
+    except _CAUGHT as exc:
+        return None, _problem_text(exc), True
     finally:
-        conn.close()
+        _close(conn)
+
+
+def _tran_note(batches, upto):
+    """A sentence when a batch up to index upto holds BEGIN TRANSACTION, else ''."""
+    found = [str(b.index) for b in batches if b.tran and b.index <= upto]
+    if not found:
+        return ""
+    return ("batch(es) %s contain BEGIN TRANSACTION. A batch inside a "
+            "transaction that never reached COMMIT is not committed, so the "
+            "counts above may be too high. The connection was closed, which "
+            "ends the session. Check the server." % ", ".join(found))
 
 
 def _apply(args, connect, batches):
@@ -477,6 +611,9 @@ def _apply(args, connect, batches):
     if problem:
         print("\nstopped by an unexpected error; some batches may already "
               "have run and are committed (autocommit): %s" % problem)
+        note = _tran_note(batches, len(batches))
+        if note:
+            print(note)
         return EXIT_APPLY_FAILED
     executed, failure = value
     if failure:
@@ -485,6 +622,13 @@ def _apply(args, connect, batches):
             batch_label(b), run, b.summary, detail))
         print("%d earlier batch(es) already ran and are committed "
               "(autocommit). Nothing rolls back." % executed)
+        if run > 1:
+            print("Runs 1 to %d of this batch also ran and are committed."
+                  % (run - 1))
+        print("The failing run may also have changed data before it stopped.")
+        note = _tran_note(batches, b.index)
+        if note:
+            print(note)
         return EXIT_APPLY_FAILED
     print("\nDEPLOY OK - %d batch(es) executed." % executed)
     return EXIT_OK
@@ -500,7 +644,10 @@ class _FakeCursor(object):
     """Stands in for a DB-API cursor.
 
     BADSYNTAX raises at parse and at run. RUNFAIL raises only when the batch
-    really runs. MULTI gives one extra result set. NEXTFAIL raises from nextset.
+    really runs. FAILRUN2 raises on the second real run. MULTI gives one extra
+    result set. NEXTFAIL raises from nextset. LONGERR raises a 500 character
+    message. LITERALERR raises a message that repeats a string literal. CTRLC
+    raises KeyboardInterrupt when the batch really runs.
     """
 
     def __init__(self, log, fail_on=False, fail_off=False):
@@ -509,6 +656,7 @@ class _FakeCursor(object):
         self.fail_on = fail_on
         self.fail_off = fail_off
         self.pending = 0
+        self.runs = 0
 
     def execute(self, sql):
         if sql == "SET PARSEONLY ON":
@@ -528,6 +676,16 @@ class _FakeCursor(object):
                 raise _FakeError("Incorrect syntax near 'BADSYNTAX'.")
             if "RUNFAIL" in sql and not self.parseonly:
                 raise _FakeError("run-time failure")
+            if "LONGERR" in sql:
+                raise _FakeError("x" * 500)
+            if "LITERALERR" in sql:
+                raise _FakeError("Incorrect syntax near 'Sup3rS3cret!x'.")
+            if "FAILRUN2" in sql and not self.parseonly:
+                self.runs += 1
+                if self.runs == 2:
+                    raise _FakeError("second run failed")
+            if "CTRLC" in sql and not self.parseonly:
+                raise KeyboardInterrupt()
             if "BOOMPARSE" in sql:
                 raise RuntimeError("not a driver error")
             if "BOOMRUN" in sql and not self.parseonly:
@@ -545,15 +703,18 @@ class _FakeCursor(object):
 
 
 class _FakeConn(object):
-    def __init__(self, log, **kw):
+    def __init__(self, log, fail_close=False, **kw):
         self.log = log
         self.kw = kw
+        self.fail_close = fail_close
         self.closed = False
 
     def cursor(self):
         return _FakeCursor(self.log, **self.kw)
 
     def close(self):
+        if self.fail_close:
+            raise _FakeError("close failed")
         self.closed = True
 
 
@@ -663,7 +824,23 @@ def self_test():
     check(len(b) == 2 and b[0].last_line == 1,
           "a form feed is not a line break  <-- pinned defect")
     b, p = split_script("SELECT 1\rGO\rSELECT 2\r")
-    check(len(b) == 2, "a bare CR counts as a line break")
+    check([x.text for x in b] == ["SELECT 1\r", "SELECT 2\r"],
+          "a bare CR counts as a line break and stays in the batch text")
+    for word in ("GO@x", "GO#x", "GO$x"):
+        b, p = split_script("SELECT 1\n%s\n" % word)
+        check(len(b) == 1 and not p, "%s is not GO" % word)
+    b, p = split_script("SELECT 1\nGO 2\nSELECT 2\nGO 10000\n")
+    check(b[0].repeat == 2 and b[1].repeat == 10000 and not p,
+          "a GO count up to the limit is read")
+    for text, label in (("SELECT 1\nGO 10001\n", "10001"),
+                        ("SELECT 1\nGO 99999999999\n", "an 11 digit count"),
+                        ("SELECT 1\nGO " + "9" * 5000 + "\n", "a 5000 digit count")):
+        b, p = split_script(text)
+        check(len(p) == 1 and "no larger than" in p[0][1] and b[0].repeat == 1,
+              "GO %s is REFUSED, not run that many times  <-- pinned defect" % label)
+    b, p = split_script("SELECT 1\nGO \u0661\n")
+    check(len(p) == 1 and "malformed" in p[0][1],
+          "an Arabic-Indic digit count is REFUSED as malformed")
 
     # ---- GO that is not a separator, or is not certain
     b, p = split_script("/*\nGO\n*/\nSELECT 1\nGO\n")
@@ -686,6 +863,15 @@ def self_test():
     check(len(b) == 2 and not p, "a closed bracketed name ends cleanly")
     b, p = split_script('SELECT "a b"\nGO\nSELECT 2\n')
     check(len(b) == 2 and not p, "a double-quoted name is read as a name")
+    b, p = split_script("SELECT [a]]\nGO\nb]\nGO\n")
+    check(len(p) == 1 and p[0][0] == 2,
+          "a GO line after an escaped ]] stays inside the bracketed name  <-- pinned defect")
+    b, p = split_script('SELECT "a\nGO\nb"\nGO\n')
+    check(len(p) == 1 and p[0][0] == 2,
+          "a GO line inside a double-quoted name is REFUSED  <-- pinned defect")
+    b, p = split_script("SELECT 'open\n")
+    check(len(p) == 1 and "unclosed" in p[0][1],
+          "a string left open at the end with no GO is REFUSED  <-- pinned defect")
 
     # ---- nested comments: the Microsoft block-comment page documents nesting
     b, p = split_script("/* a /* b */ c */\nSELECT 1\nGO\n")
@@ -718,10 +904,40 @@ def self_test():
     b, p = split_script("SET PARSEONLY OFF\nGO\nDROP TABLE t\nGO\n")
     check(len(p) == 1 and "PARSEONLY" in p[0][1],
           "a script that sets PARSEONLY is REFUSED  <-- pinned defect")
+    for text, label in (("set parseonly off\nGO\n", "lowercase"),
+                        ("SET\tPARSEONLY\tOFF\nGO\n", "tab separated"),
+                        ("SET\r\nPARSEONLY\r\nOFF\r\nGO\r\n", "CRLF separated"),
+                        ("SET PARSEONLY", "at the end of the file"),
+                        ("SELECT [x]]'y]\nSET PARSEONLY OFF\nGO\n", "after an escaped ]] in a name")):
+        b, p = split_script(text)
+        check(len(p) == 1 and "PARSEONLY" in p[0][1],
+              "SET PARSEONLY %s is REFUSED  <-- pinned defect" % label)
     b, p = split_script("-- SET PARSEONLY OFF\nSELECT 'parseonly'\nGO\n")
     check(not p, "PARSEONLY in a comment or a string is not a problem")
+    for name in ("NOEXEC", "noexec", "FMTONLY", "SHOWPLAN_ALL", "SHOWPLAN_TEXT",
+                 "SHOWPLAN_XML", "IMPLICIT_TRANSACTIONS"):
+        b, p = split_script("SET %s ON\nGO\nCREATE TABLE t (a int)\nGO\n" % name)
+        check(len(p) == 1 and name.upper() in p[0][1],
+              "SET %s is REFUSED  <-- pinned defect" % name)
+    b, p = split_script("SELECT 'SET NOEXEC ON' -- SET NOEXEC ON\nGO\n")
+    check(not p, "NOEXEC in a comment or a string is not a problem")
+    b, p = split_script("SELECT noexec FROM t\nGO\n")
+    check(not p, "NOEXEC that is not preceded by SET is not a problem")
+    b, p = split_script("BEGIN TRY\nSELECT 1\nEND TRY\nBEGIN CATCH\nSELECT 2\nEND CATCH\nGO\nBEGIN\n  TRAN\nGO\n")
+    check([x.tran for x in b] == [False, True],
+          "BEGIN TRY is not a transaction and BEGIN with TRAN on the next line is")
+    b, p = split_script("begin distributed transaction\nGO\nSELECT 'begin tran'\nGO\n")
+    check([x.tran for x in b] == [True, False] and not p,
+          "BEGIN DISTRIBUTED TRANSACTION is flagged and a literal is not")
     b, p = split_script(":setvar x 1\nSELECT 1\nGO\n")
     check(len(p) == 1 and "sqlcmd" in p[0][1], "a sqlcmd directive is REFUSED")
+    b, p = split_script("SELECT 1\n:r other.sql\nGO\n")
+    check(len(p) == 1 and "sqlcmd" in p[0][1],
+          "a directive on the second line of a batch is REFUSED  <-- pinned defect")
+    b, p = split_script("SELECT 1\n   :setvar x 1\nGO\n")
+    check(len(p) == 1 and "sqlcmd" in p[0][1], "an indented directive is REFUSED")
+    b, p = split_script("SELECT '\n:x\n'\nGO\n")
+    check(not p, "a line inside a string that starts with a colon is not a directive")
     b, p = split_script("SELECT 1\n::fn_x()\nGO\n")
     check(not p, "a :: function call is not a sqlcmd directive")
 
@@ -729,14 +945,30 @@ def self_test():
     b, p = split_script("/* header\nDROP TABLE victim\n*/\n-- note\nCREATE TABLE t (a int)\nGO\n")
     check(b[0].summary == "CREATE TABLE t (a int)",
           "the summary skips a block-comment header whose prose has no marker")
+    b, p = split_script("SELECT 1\nFROM t\nWHERE a = 1\nGO\n")
+    check(batch_label(b[0]) == "batch 1 (lines 1-3)",
+          "the batch label gives the first and last line of a multi-line batch")
     b, p = split_script("-- only a note\nGO\nSELECT 1\nGO\n")
     check(b[0].empty and b[0].summary == COMMENTS_ONLY and not b[1].empty,
           "a comment-only batch is marked empty")
-    b, p = split_script("SELECT '" + "x" * 200 + "'\nGO\n")
+    b, p = split_script("SELECT " + "x" * 200 + "\nGO\n")
     check(len(b[0].summary) == SUMMARY_WIDTH, "a long first statement is cut to the summary width")
-    b, p = split_script("SELECT 'caf\u00e9\x1b[31m'\nGO\n")
+    b, p = split_script("SELECT [caf\u00e9\x1b[31m]\nGO\n")
     check(all(32 <= ord(ch) < 127 for ch in b[0].summary),
           "a non-ASCII or escape character in a summary becomes ?  <-- pinned defect")
+    check(ascii_safe("a\x7fb") == "a?b" and ascii_safe("a~ b") == "a~ b",
+          "DEL becomes ? and the last printable character ~ stays")
+    b, p = split_script("CREATE LOGIN svc WITH PASSWORD = 'Sup3rS3cret!x'\nGO\n")
+    check("Sup3rS3cret" not in b[0].summary and b[0].summary.endswith("'***'") and b[0].quoted,
+          "a password literal is masked in the batch summary  <-- pinned defect")
+    b, p = split_script("SELECT [it's], N'abc', \"def\", 'it''s'\nGO\n")
+    check(b[0].summary == "SELECT [it's], N'***', \"***\", '***''***'",
+          "bracketed names stay, each literal is masked, a doubled quote masks twice")
+    b, p = split_script("SELECT 'a\nb' + x\nGO\n")
+    check(b[0].summary == "SELECT '***' + x",
+          "a literal that spans lines is masked as one")
+    b, p = split_script("SELECT ''\nGO\nSELECT 1\nGO\n")
+    check(not b[0].quoted and not b[1].quoted, "an empty literal or none is not quoted")
 
     # ---- decoding
     check(decode_sql(b"SELECT 1") == "SELECT 1", "plain UTF-8 decodes")
@@ -746,6 +978,11 @@ def self_test():
           "UTF-16 BE with a BOM decodes")
     raises(lambda: decode_sql(b"\xff\xfe\x00"), "a truncated UTF-16 file raises")
     raises(lambda: decode_sql(b"SELECT \x80"), "bytes that are not UTF-8 raise")
+    raises(lambda: decode_sql("SELECT 1".encode("utf-16-le")),
+           "UTF-16 without a BOM is REFUSED: it decodes to NULs  <-- pinned defect")
+    raises(lambda: decode_sql(b"SELECT 1\x00; DROP TABLE t"), "a NUL character is REFUSED")
+    raises(lambda: decode_sql(b"\xff\xfe\x00\x00" + "SELECT 1".encode("utf-32-le")),
+           "UTF-32 is REFUSED")
 
     # ---- connection string
     s = build_conn_string("HOST\\INST,1433", "db1", DEFAULT_ODBC_DRIVER, False)
@@ -762,6 +999,10 @@ def self_test():
     raises(lambda: build_conn_string("h", "d}", "x", False), "a brace in a value is REFUSED")
     raises(lambda: build_conn_string("h", "d\nx", "x", False), "a newline in a value is REFUSED")
     raises(lambda: build_conn_string("", "d", "x", False), "an empty server is REFUSED")
+    raises(lambda: build_conn_string("h", "d", "x};UID=sa;PWD=x;DRIVER={x", False),
+           "a brace and a semicolon in the ODBC driver name are REFUSED  <-- pinned defect")
+    raises(lambda: build_conn_string("h", "d", "", False), "an empty ODBC driver is REFUSED")
+    raises(lambda: build_conn_string("h", "", "x", False), "an empty database is REFUSED")
 
     # ---- parse_check and run_batches against the fake cursor
     script = "CREATE TABLE a (x int)\nGO\nINSERT a VALUES (1)\nGO 2\n-- note\nGO\n"
@@ -790,6 +1031,19 @@ def self_test():
     text = "\n".join(format_check(res))
     check("batch 2 (lines 3-3): PARSE ERROR: BADSYNTAX here" in text,
           "the report names the failing batch, its lines and its first statement")
+    check("\n      Incorrect syntax near" in text,
+          "the server message sits on its own line, indented six spaces")
+    res = parse_check(_FakeCursor([]), _FakeError,
+                      split_script("SELECT 1\nGO\nLONGERR\nGO\n")[0])
+    check(len(res[1][2]) == DETAIL_WIDTH == 300, "a long server message is cut to 300 characters")
+    res = parse_check(_FakeCursor([]), _FakeError,
+                      split_script("ALTER LOGIN a WITH PASSWORD = 'Hunter2' LITERALERR\nGO\n")[0])
+    check(res[0][2] == "Incorrect syntax near '***'." and "Sup3r" not in "\n".join(format_check(res)),
+          "a literal the server repeats in its message is masked  <-- pinned defect")
+    res = parse_check(_FakeCursor([]), _FakeError,
+                      split_script("SELECT 1 LITERALERR\nGO\n")[0])
+    check("Sup3rS3cret" in res[0][2],
+          "a batch with no literal keeps the server message as it is")
 
     log = []
     raises_in = []
@@ -827,6 +1081,10 @@ def self_test():
           "run_batches stops at the first run-time failure")
     check(len(kinds(log, "exec")) == 2, "nothing after the failing batch ran")
     n, fail = run_batches(_FakeCursor([]), _FakeError,
+                          split_script("SELECT 1\nGO\nFAILRUN2\nGO 3\n")[0])
+    check(n == 1 and fail[0].index == 2 and fail[1] == 2,
+          "run_batches reports the run number that failed  <-- pinned defect")
+    n, fail = run_batches(_FakeCursor([]), _FakeError,
                           split_script("SELECT 1\nGO\nNEXTFAIL\nGO\n")[0])
     check(fail is not None and fail[0].index == 2,
           "an error raised from a later result set is caught  <-- pinned defect")
@@ -850,6 +1108,13 @@ def self_test():
         blank = write("blank.sql", b"-- nothing here\nGO\n")
         binary = write("binary.sql", b"SELECT \x80\n")
         server = ["--server", "HOST", "--database", "db1"]
+        header = write("header.sql", b"-- header note\nGO\nSELECT 1\nGO\n")
+        run2 = write("run2.sql", b"SELECT 1\nGO\nFAILRUN2 x\nGO 3\n")
+        tran_fail = write("tran_fail.sql", b"BEGIN TRANSACTION\nGO\nCREATE TABLE a (x int)\nGO\nRUNFAIL\nGO\n")
+        tran_boom = write("tran_boom.sql", b"BEGIN TRANSACTION\nGO\nBOOMRUN\nGO\n")
+        tran_late = write("tran_late.sql", b"SELECT 1\nGO\nRUNFAIL\nGO\nBEGIN TRAN\nGO\n")
+        ctrlc = write("ctrlc.sql", b"SELECT 1\nGO\nCTRLC\nGO\nSELECT 3\nGO\n")
+        accent = write("caf\u00e9.sql", b"SELECT 1\nGO\n")
 
         # ---- the argument parser
         ok = _parser().parse_args([good, "--split-only"])
@@ -876,6 +1141,24 @@ def self_test():
         check(code == EXIT_USAGE and not conns and "cannot read" not in err,
               "--dry-run is REFUSED, not ignored  <-- pinned defect")
         check(_parser().allow_abbrev is False, "the parser sets allow_abbrev=False")
+        check((EXIT_OK, EXIT_REFUSED, EXIT_APPLY_FAILED, EXIT_CONNECT, EXIT_USAGE)
+              == (0, 1, 2, 3, 64), "the exit codes are 0, 1, 2, 3 and 64 as the README says")
+        for argv in ([good, "--split-only", "--password", "hunter2"],
+                     [good, "--split-only", "--password=hunter2"],
+                     ["--password", "hunter2", good, "--split-only"]):
+            code, out, err = run(argv)
+            check(code == EXIT_USAGE and "--password" in err and "hunter2" not in err + out,
+                  "an unknown flag is named but its value is not echoed  <-- pinned defect")
+        code, out, err = run([good, "--split-only", "--apply=hunter2"])
+        check(code == EXIT_USAGE and "takes no value" in err and "hunter2" not in err,
+              "a value given to --apply is refused without echoing it  <-- pinned defect")
+        code, out, err = run([good, "--split-only", "--server"])
+        check(code == EXIT_USAGE and "expected one argument" in err,
+              "a flag that needs a value and has none is a usage error")
+        code, out, err = run([good, "--split-only", "--caf\u00e9", "--" + "a" * 50])
+        check(code == EXIT_USAGE and "2 more not shown" in err
+              and all(32 <= ord(ch) < 127 for ch in err.strip()),
+              "a flag with odd characters or a long name is counted, not echoed")
         sel_refused = False
         try:
             _parser().parse_args(["--sel"])
@@ -907,6 +1190,12 @@ def self_test():
         code, out, err = run([good, "--split-only"])
         check(code == EXIT_OK and "2 batch(es)" in out and "SPLIT ONLY" in out,
               "--split-only lists the batches and exits 0")
+        code, out, err = run([accent, "--split-only"])
+        check(code == EXIT_OK and "caf?.sql: 1 batch(es)" in out,
+              "a non-ASCII character in the script path is printed as ?  <-- pinned defect")
+        code, out, err = run([header, "--split-only"])
+        check(code == 0 and "2 batch(es), 1 with statements" in out,
+              "--split-only exits 0 for a script with a comment-only first batch")
 
         log, conns = [], []
         code, out, err = run([good] + server, _fake_connect(log, conns))
@@ -918,8 +1207,16 @@ def self_test():
               "main() connects with the built connection string")
 
         log, conns = [], []
+        code, out, err = run([header] + server, _fake_connect(log, conns))
+        check(code == 0 and "skipped, nothing to run" in out and "failed to parse" not in out,
+              "a check of a script with a comment-only batch exits 0  <-- pinned defect")
+        log, conns = [], []
+        code, out, err = run([header] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == 0 and "DEPLOY OK - 1 batch(es)" in out and len(kinds(log, "exec")) == 1,
+              "--apply runs a script with a comment-only batch  <-- pinned defect")
+        log, conns = [], []
         code, out, err = run([broken] + server, _fake_connect(log, conns))
-        check(code == EXIT_REFUSED and "1 batch(es) failed to parse" in out,
+        check(code == 1 and "1 batch(es) failed to parse" in out,
               "a check with a bad batch exits 1")
         log, conns = [], []
         code, out, err = run([broken] + server + ["--apply"], _fake_connect(log, conns))
@@ -941,6 +1238,47 @@ def self_test():
         check(code == EXIT_APPLY_FAILED and "already ran and are committed" in out,
               "a run-time failure under --apply exits 2 and says what is committed")
         check(len(kinds(log, "exec")) == 2, "--apply stops at the failing batch")
+        check(code == 2, "a run-time failure under --apply exits with the number 2")
+        check("1 earlier batch(es) already ran" in out and "Runs 1 to" not in out
+              and "contain BEGIN TRANSACTION" not in out,
+              "a failure on run 1 prints neither a run count nor a transaction note")
+
+        log, conns = [], []
+        code, out, err = run([run2] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == EXIT_APPLY_FAILED and "batch 2 (lines 3-3) FAILED on run 2:" in out
+              and "1 earlier batch(es) already ran" in out
+              and "Runs 1 to 1 of this batch also ran and are committed." in out
+              and "may also have changed data" in out,
+              "a GO N batch that fails on run 2 says run 1 is committed  <-- pinned defect")
+
+        log, conns = [], []
+        code, out, err = run([tran_fail] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == EXIT_APPLY_FAILED and "batch(es) 1 contain BEGIN TRANSACTION" in out
+              and "may be too high" in out,
+              "a failure in a script with BEGIN TRANSACTION does not promise a commit  <-- pinned defect")
+        code, out, err = run([tran_boom] + server + ["--apply"], _fake_connect([], []))
+        check(code == EXIT_APPLY_FAILED and "unexpected error" in out
+              and "batch(es) 1 contain BEGIN TRANSACTION" in out,
+              "an unexpected error in a script with BEGIN TRANSACTION carries the same note")
+        code, out, err = run([tran_late] + server + ["--apply"], _fake_connect([], []))
+        check(code == EXIT_APPLY_FAILED and "contain BEGIN TRANSACTION" not in out,
+              "a BEGIN TRANSACTION in a batch after the failure is not mentioned")
+
+        log, conns = [], []
+        code, out, err = run([ctrlc] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == EXIT_APPLY_FAILED and "unexpected error" in out and "KeyboardInterrupt" in out
+              and conns[1].closed and len(kinds(log, "exec")) == 2,
+              "Ctrl+C during --apply is caught, says some batches ran and closes  <-- pinned defect")
+
+        log, conns = [], []
+        code, out, err = run([good] + server + ["--apply"],
+                             _fake_connect(log, conns, fail_close=True))
+        check(code == EXIT_OK and "DEPLOY OK - 2 batch(es)" in out
+              and "warning: closing the connection failed: close failed" in err,
+              "a close error after --apply still prints the verdict  <-- pinned defect")
+        code, out, err = run([good] + server, _fake_connect([], [], fail_close=True))
+        check(code == EXIT_OK and "CHECK MODE" in out and "closing the connection failed" in err,
+              "a close error after a check still prints the verdict")
 
         code, out, err = run([junk] + server, _fake_connect([], conns))
         check(code == EXIT_REFUSED and "REFUSED" in out and "nothing was sent" in out,
