@@ -63,10 +63,12 @@ _PARSEONLY_RE = re.compile(r"\bPARSEONLY\b", re.IGNORECASE)
 # Settings that stop later batches from running while the server still says OK.
 # The Microsoft pages for each say statements are not executed (NOEXEC,
 # SHOWPLAN_*), only metadata comes back (FMTONLY), or a transaction stays open
-# (IMPLICIT_TRANSACTIONS).
+# (IMPLICIT_TRANSACTIONS). The SET statements page says one SET can name
+# several options ("SET QUOTED_IDENTIFIER, ANSI_NULLS ON"), so the option may
+# follow a comma list: SET NOCOUNT, NOEXEC ON.
 _MODE_RE = re.compile(
-    r"\bSET\s+(NOEXEC|FMTONLY|SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML|"
-    r"IMPLICIT_TRANSACTIONS)\b", re.IGNORECASE)
+    r"\bSET\s+(?:[A-Z_]+\s*,\s*)*(NOEXEC|FMTONLY|SHOWPLAN_ALL|SHOWPLAN_TEXT|"
+    r"SHOWPLAN_XML|IMPLICIT_TRANSACTIONS)\b", re.IGNORECASE)
 _TRAN_RE = re.compile(r"\bBEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?\b",
                       re.IGNORECASE)
 _QUOTED_DETAIL_RE = re.compile(r"'(?:[^']|'')*'")
@@ -940,6 +942,97 @@ def self_test():
     check(not p, "a line inside a string that starts with a colon is not a directive")
     b, p = split_script("SELECT 1\n::fn_x()\nGO\n")
     check(not p, "a :: function call is not a sqlcmd directive")
+
+    # ---- a stacked statement after a line comment ended by a lone CR, and
+    # around bracket- and quote-delimited names. The -- page says a comment
+    # ends at a carriage return, a line feed or both. The identifiers page says
+    # ]] escapes a bracket, [ needs no escape and "" escapes a double quote.
+    def hits(text, word):
+        return [m for _, m in split_script(text)[1] if word in m]
+
+    for text, word, label in (
+            ("-- note\rSET NOEXEC ON\rGO\rSELECT 1\rGO\r", "NOEXEC", "a lone CR"),
+            ("SELECT 1 -- note\rSET NOEXEC ON\rGO\r", "NOEXEC", "a lone CR after code"),
+            ("-- note\r\nSET NOEXEC ON\r\nGO\r\n", "NOEXEC", "CRLF"),
+            ("-- note\nSET NOEXEC ON\nGO\n", "NOEXEC", "LF"),
+            ("-- a\r-- b\rSET PARSEONLY OFF\rGO\r", "PARSEONLY", "two lone CR comments"),
+            ("GO -- done\rSET NOEXEC ON\rGO\r", "NOEXEC", "a lone CR after GO")):
+        check(len(hits(text, word)) == 1,
+              "SET after a line comment ended by %s is REFUSED  <-- pinned defect" % label)
+    b, p = split_script("-- note\rBEGIN TRAN\rGO\r")
+    check([x.tran for x in b] == [True],
+          "BEGIN TRAN after a lone CR comment is seen  <-- pinned defect")
+    b, p = split_script("-- note\r:r other.sql\rGO\r")
+    check(len(p) == 1 and "sqlcmd" in p[0][1],
+          "a directive after a lone CR comment is REFUSED  <-- pinned defect")
+    b, p = split_script("-- note\rSELECT 1\rGO\r")
+    check(b[0].summary == "SELECT 1" and (b[0].first_line, b[0].last_line) == (1, 2),
+          "the summary skips a comment ended by a lone CR")
+    b, p = split_script("SELECT 1 -- note\rGO\rSELECT 2\r")
+    check(len(b) == 2 and not p, "GO after a lone CR comment splits")
+    b, p = split_script("SELECT 1\r-- note\rGO 2\r")
+    check(b[0].repeat == 2 and not p, "a GO count after a lone CR comment is read")
+    for sep in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c"):
+        check(not hits("-- note%sSET NOEXEC ON\nGO\n" % sep, "NOEXEC"),
+              "U+%04X does not end a -- comment: only CR and LF do" % ord(sep))
+    check(not hits("-- SET NOEXEC ON\rSELECT 1\rGO\r", "NOEXEC"),
+          "SET inside a comment on the same line is not a problem")
+    for text, label in (("SELECT [a -- b\rSET NOEXEC ON]\rGO\r", "a bracketed name"),
+                        ("SELECT '-- b\rSET NOEXEC ON'\rGO\r", "a string"),
+                        ('SELECT "-- b\rSET NOEXEC ON"\rGO\r', "a double-quoted name")):
+        check(not hits(text, "NOEXEC"), "-- and a lone CR inside %s open no comment" % label)
+
+    for text, label in (
+            ("SELECT [a]; SET NOEXEC ON\nGO\n", "a closed bracketed name"),
+            ("SELECT [a]]]; SET NOEXEC ON\nGO\n", "a bracketed name that ends in ]]]"),
+            ("SELECT [a[b]; SET NOEXEC ON\nGO\n", "a [ inside a bracketed name"),
+            ("SELECT [a--b]; SET NOEXEC ON\nGO\n", "-- inside a bracketed name"),
+            ("SELECT [a/*b]; SET NOEXEC ON\nGO\n", "/* inside a bracketed name"),
+            ("SELECT [it's]; SET NOEXEC ON\nGO\n", "a quote inside a bracketed name"),
+            ('SELECT "a""b"; SET NOEXEC ON\nGO\n', "a doubled double quote"),
+            ('SELECT "a--b"; SET NOEXEC ON\nGO\n', "-- inside a double-quoted name"),
+            ('SELECT "a[b"; SET NOEXEC ON\nGO\n', "[ inside a double-quoted name"),
+            ("SELECT 'it''s'; SET NOEXEC ON\nGO\n", "a doubled single quote"),
+            ("SELECT '/*'; SET NOEXEC ON\nGO\n", "/* inside a string"),
+            ("SELECT '--'; SET NOEXEC ON\nGO\n", "-- inside a string"),
+            ("SELECT '['; SET NOEXEC ON\nGO\n", "[ inside a string"),
+            ("/* a /* b */ c */ SET NOEXEC ON\nGO\n", "a nested comment"),
+            ("/* a -- */ SET NOEXEC ON\nGO\n", "-- inside a block comment"),
+            ("/* a [ ' */ SET NOEXEC ON\nGO\n", "[ and a quote inside a block comment")):
+        check(len(hits(text, "NOEXEC")) == 1,
+              "SET NOEXEC after %s is REFUSED  <-- pinned defect" % label)
+    for text, label in (
+            ("SELECT [SET NOEXEC ON]\nGO\n", "a bracketed name"),
+            ("SELECT [a]]; SET NOEXEC ON]\nGO\n", "a name with an escaped ]]"),
+            ('SELECT "a""; SET NOEXEC ON"\nGO\n', "a doubled double quote"),
+            ("SELECT 'it''s; SET NOEXEC ON'\nGO\n", "a doubled single quote"),
+            ("/* a /* b */ SET NOEXEC ON */ */\nGO\n", "a nested comment")):
+        check(not hits(text, "NOEXEC"), "SET NOEXEC inside %s is not a problem" % label)
+    check(len(hits("SELECT [a]; SET PARSEONLY OFF\nGO\n", "PARSEONLY")) == 1
+          and not hits("SELECT [SET PARSEONLY OFF]\nGO\n", "PARSEONLY"),
+          "PARSEONLY after a bracketed name is REFUSED and inside it is not")
+    b, p = split_script("SELECT [a]; BEGIN TRAN\nGO\nSELECT [BEGIN TRAN]\nGO\n")
+    check([x.tran for x in b] == [True, False],
+          "BEGIN TRAN after a bracketed name is seen and inside it is not")
+    b, p = split_script("SELECT [a\r:r x]\nGO\n")
+    check(not p, "a line inside a bracketed name that starts with a colon is not a directive")
+
+    # ---- several options in one SET: the SET statements page documents
+    # "SET QUOTED_IDENTIFIER, ANSI_NULLS ON"
+    for text, word, label in (
+            ("SET NOCOUNT, NOEXEC ON\nGO\n", "NOEXEC", "NOEXEC after one option"),
+            ("SET XACT_ABORT, NOCOUNT, FMTONLY ON\nGO\n", "FMTONLY", "FMTONLY after two options"),
+            ("set nocount ,\r\nnoexec on\r\nGO\r\n", "NOEXEC", "NOEXEC across lines in lowercase"),
+            ("SET NOCOUNT, /* x */ NOEXEC ON\nGO\n", "NOEXEC", "NOEXEC after a comment"),
+            ("SET NOCOUNT, SHOWPLAN_XML ON\nGO\n", "SHOWPLAN_XML", "SHOWPLAN_XML"),
+            ("SET NOCOUNT, IMPLICIT_TRANSACTIONS ON\nGO\n", "IMPLICIT_TRANSACTIONS",
+             "IMPLICIT_TRANSACTIONS")):
+        check(len(hits(text, word)) == 1,
+              "SET with several options is REFUSED: %s  <-- pinned defect" % label)
+    for text, label in (("SET NOCOUNT, XACT_ABORT ON\nGO\n", "two harmless options"),
+                        ("UPDATE t SET a = 1, noexec = 2\nGO\n", "a column named noexec"),
+                        ("SELECT 'SET NOCOUNT, NOEXEC ON'\nGO\n", "a string")):
+        check(not split_script(text)[1], "%s is not a problem" % label)
 
     # ---- summaries
     b, p = split_script("/* header\nDROP TABLE victim\n*/\n-- note\nCREATE TABLE t (a int)\nGO\n")
