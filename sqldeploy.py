@@ -72,6 +72,8 @@ _MODE_RE = re.compile(
 _TRAN_RE = re.compile(r"\bBEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?\b",
                       re.IGNORECASE)
 _QUOTED_DETAIL_RE = re.compile(r"'(?:[^']|'')*'")
+# Msg 2601 and 2627 print the key value in parentheses, not in quotes.
+_KEY_DETAIL_RE = re.compile(r"(duplicate key value is )\(.*\)\.", re.IGNORECASE)
 _FLAG_NAME_RE = re.compile(r"--[A-Za-z][A-Za-z0-9-]{0,39}\Z")
 _DIRECTIVE_RE = re.compile(r"^\s*:[A-Za-z]", re.MULTILINE)
 _UNSAFE_CHARS_RE = re.compile(r"[^\x20-\x7e]")
@@ -217,6 +219,7 @@ def server_detail(exc, batch):
     text = " ".join(str(exc).split())
     if batch.quoted:
         text = _QUOTED_DETAIL_RE.sub("'%s'" % MASK, text)
+        text = _KEY_DETAIL_RE.sub(r"\1(%s)." % MASK, text)
     return one_line(text, DETAIL_WIDTH)
 
 
@@ -593,6 +596,18 @@ def _with_connection(connect, conn_string, work):
         _close(conn)
 
 
+def run_and_count(cur, err, batches):
+    """run_batches, then ask the server how many transactions are still open.
+
+    Returns (executed, failure, open_trans). open_trans is None after a failure.
+    """
+    executed, failure = run_batches(cur, err, batches)
+    if failure:
+        return executed, failure, None
+    cur.execute("SELECT @@TRANCOUNT")
+    return executed, None, cur.fetchone()[0]
+
+
 def _tran_note(batches, upto):
     """A sentence when a batch up to index upto holds BEGIN TRANSACTION, else ''."""
     found = [str(b.index) for b in batches if b.tran and b.index <= upto]
@@ -607,7 +622,7 @@ def _tran_note(batches, upto):
 def _apply(args, connect, batches):
     value, problem, opened = _with_connection(
         connect, args.conn_string,
-        lambda cur, err: run_batches(cur, err, batches))
+        lambda cur, err: run_and_count(cur, err, batches))
     if problem and not opened:
         return _fail(EXIT_CONNECT, "no batch was run: %s" % problem)
     if problem:
@@ -617,7 +632,7 @@ def _apply(args, connect, batches):
         if note:
             print(note)
         return EXIT_APPLY_FAILED
-    executed, failure = value
+    executed, failure, open_trans = value
     if failure:
         b, run, detail = failure
         print("\n%s FAILED on run %d: %s\n      %s" % (
@@ -631,6 +646,13 @@ def _apply(args, connect, batches):
         note = _tran_note(batches, b.index)
         if note:
             print(note)
+        return EXIT_APPLY_FAILED
+    if open_trans:
+        print("\nDEPLOY INCOMPLETE - %d batch(es) executed, but %d "
+              "transaction(s) were still open at the end (a missing COMMIT?). "
+              "The connection was closed, which ends the session. The tool "
+              "did not confirm what the server kept. Check the server."
+              % (executed, open_trans))
         return EXIT_APPLY_FAILED
     print("\nDEPLOY OK - %d batch(es) executed." % executed)
     return EXIT_OK
@@ -647,13 +669,16 @@ class _FakeCursor(object):
 
     BADSYNTAX raises at parse and at run. RUNFAIL raises only when the batch
     really runs. FAILRUN2 raises on the second real run. MULTI gives one extra
-    result set. NEXTFAIL raises from nextset. LONGERR raises a 500 character
+    result set. DUPKEY raises a duplicate key message that holds the key value
+    in parentheses, as Msg 2627 does. NEXTFAIL raises from nextset. LONGERR raises a 500 character
     message. LITERALERR raises a message that repeats a string literal. CTRLC
     raises KeyboardInterrupt when the batch really runs.
     """
 
-    def __init__(self, log, fail_on=False, fail_off=False):
+    def __init__(self, log, fail_on=False, fail_off=False, fail_count=False):
         self.log = log
+        self.fail_count = fail_count
+        self.trancount = 0
         self.parseonly = False
         self.fail_on = fail_on
         self.fail_off = fail_off
@@ -666,6 +691,9 @@ class _FakeCursor(object):
                 raise _FakeError("permission denied")
             self.parseonly = True
             self.log.append(("flag", "on"))
+        elif sql == "SELECT @@TRANCOUNT":
+            if self.fail_count:
+                raise _FakeError("count failed")
         elif sql == "SET PARSEONLY OFF":
             if self.fail_off:
                 raise _FakeError("connection lost")
@@ -680,6 +708,10 @@ class _FakeCursor(object):
                 raise _FakeError("run-time failure")
             if "LONGERR" in sql:
                 raise _FakeError("x" * 500)
+            if "DUPKEY" in sql and not self.parseonly:
+                raise _FakeError("Violation of PRIMARY KEY constraint 'PK_cfg'. "
+                                 "Cannot insert duplicate key in object 'dbo.cfg'. "
+                                 "The duplicate key value is (Sup3rS3cret!x). (2627)")
             if "LITERALERR" in sql:
                 raise _FakeError("Incorrect syntax near 'Sup3rS3cret!x'.")
             if "FAILRUN2" in sql and not self.parseonly:
@@ -692,8 +724,16 @@ class _FakeCursor(object):
                 raise RuntimeError("not a driver error")
             if "BOOMRUN" in sql and not self.parseonly:
                 raise RuntimeError("not a driver error")
+            if not self.parseonly:
+                if "BEGIN TRAN" in sql:
+                    self.trancount += 1
+                if "COMMIT" in sql:
+                    self.trancount = 0
             self.pending = 1 if "MULTI" in sql or "NEXTFAIL" in sql else 0
             self.next_sql = sql
+
+    def fetchone(self):
+        return (self.trancount,)
 
     def nextset(self):
         if self.pending:
@@ -1206,6 +1246,9 @@ def self_test():
         tran_fail = write("tran_fail.sql", b"BEGIN TRANSACTION\nGO\nCREATE TABLE a (x int)\nGO\nRUNFAIL\nGO\n")
         tran_boom = write("tran_boom.sql", b"BEGIN TRANSACTION\nGO\nBOOMRUN\nGO\n")
         tran_late = write("tran_late.sql", b"SELECT 1\nGO\nRUNFAIL\nGO\nBEGIN TRAN\nGO\n")
+        open_tran = write("open_tran.sql", b"BEGIN TRANSACTION\nGO\nCREATE TABLE a (x int)\nGO\n")
+        shut_tran = write("shut_tran.sql", b"BEGIN TRANSACTION\nGO\nCREATE TABLE a (x int)\nGO\nCOMMIT\nGO\n")
+        dupkey = write("dupkey.sql", b"INSERT dbo.cfg (k) VALUES ('Sup3rS3cret!x') -- DUPKEY\nGO\n")
         ctrlc = write("ctrlc.sql", b"SELECT 1\nGO\nCTRLC\nGO\nSELECT 3\nGO\n")
         accent = write("caf\u00e9.sql", b"SELECT 1\nGO\n")
 
@@ -1358,6 +1401,24 @@ def self_test():
               "a BEGIN TRANSACTION in a batch after the failure is not mentioned")
 
         log, conns = [], []
+        code, out, err = run([open_tran] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == EXIT_APPLY_FAILED and "DEPLOY INCOMPLETE" in out and "DEPLOY OK" not in out
+              and "1 transaction(s) were still open" in out and conns[1].closed,
+              "a script that opens a transaction and never commits is not reported OK  <-- pinned defect")
+        code, out, err = run([shut_tran] + server + ["--apply"], _fake_connect([], []))
+        check(code == EXIT_OK and "DEPLOY OK - 3 batch(es)" in out,
+              "a script that commits what it opens is reported OK")
+        code, out, err = run([good] + server + ["--apply"], _fake_connect([], [], fail_count=True))
+        check(code == EXIT_APPLY_FAILED and "unexpected error" in out and "count failed" in out
+              and "DEPLOY OK" not in out,
+              "if the open transaction count cannot be read the deploy is not reported OK  <-- pinned defect")
+        log, conns = [], []
+        code, out, err = run([dupkey] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == EXIT_APPLY_FAILED and "Sup3rS3cret" not in out
+              and "The duplicate key value is (***). (2627)" in out,
+              "a duplicate key value the server prints in parentheses is masked  <-- pinned defect")
+
+        log, conns = [], []
         code, out, err = run([ctrlc] + server + ["--apply"], _fake_connect(log, conns))
         check(code == EXIT_APPLY_FAILED and "unexpected error" in out and "KeyboardInterrupt" in out
               and conns[1].closed and len(kinds(log, "exec")) == 2,
@@ -1376,6 +1437,10 @@ def self_test():
         code, out, err = run([junk] + server, _fake_connect([], conns))
         check(code == EXIT_REFUSED and "REFUSED" in out and "nothing was sent" in out,
               "a script with a split problem exits 1 before connecting")
+        utf16 = write("utf16.sql", "SELECT 1\nGO\nSELECT 2\nGO\n".encode("utf-16"))
+        code, out, err = run([utf16, "--split-only"])
+        check(code == EXIT_OK and "2 batch(es), 2 with statements" in out,
+              "a UTF-16 script with a BOM splits end to end through main()")
         code, out, err = run([blank, "--split-only"])
         check(code == EXIT_REFUSED and "no statements" in out, "a script with no statements exits 1")
         code, out, err = run([binary, "--split-only"])

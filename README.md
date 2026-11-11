@@ -72,10 +72,10 @@ PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 ...
 --------------------------------------------------------------------
-192 assertions, 0 failed
+250 assertions, 0 failed
 ```
 
-The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Python 3.9.25.
+The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
 The output is identical on Windows and Linux once the carriage returns are removed.
 No assertion depends on the platform. One assertion writes a file whose name holds an accented letter
 to the temp directory, so it needs a file system that stores such names.
@@ -119,7 +119,7 @@ python sqldeploy.py deploy.sql --server HOST --database DB --apply
 | `--trust-server-certificate` | off | Skip server certificate validation. `--split-only` accepts it and ignores it. |
 | `--split-only` | off | List the batches and exit. Cannot combine with `--apply`, `--server` or `--database`. |
 | `--apply` | off | Parse every batch, then run them. Without it nothing is written. |
-| `--self-test` | off | Run the offline assertions and exit. It ignores every other argument and every path. |
+| `--self-test` | off | Run the offline assertions and exit. It ignores a path and the valid flags next to it. An unknown flag, or a flag that lacks its value, is still refused first with exit 64. |
 
 Exit codes: 0 clean, 1 refused (a script problem or a batch that does not parse), 2 `--apply` stopped
 part way, 3 could not connect or could not enter parse-only mode, 64 usage error or unreadable file.
@@ -168,6 +168,10 @@ The rules, with the source of each:
 | A script that mentions `PARSEONLY` is refused. | The PARSEONLY page: "The setting of SET PARSEONLY is set at parse time and not at execute or run time." I could not test a real server. A script that sets it could change the mode the preview relies on. |
 | A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_ALL`, `SHOWPLAN_TEXT`, `SHOWPLAN_XML` or `IMPLICIT_TRANSACTIONS` is refused. | The NOEXEC page: SQL Server "parses and compiles each batch of Transact-SQL statements but does not execute them". The SHOWPLAN_ALL page: "Transact-SQL statements are not executed". The FMTONLY page: a rowset comes back "without any data rows". The IMPLICIT_TRANSACTIONS page: a statement starts a transaction that you must end with `COMMIT` or `ROLLBACK`. After any of these a deploy could print `DEPLOY OK` and have changed nothing. |
 | A script that holds `BEGIN TRANSACTION` is accepted. A failure message then carries a note. | The BEGIN TRANSACTION page: an explicit transaction ends only with `COMMIT` or `ROLLBACK`. Under `autocommit` a batch inside one is not committed on its own, so the "already committed" count may be too high. The note names the batches. |
+| After the last batch, `--apply` runs `SELECT @@TRANCOUNT`. A value above 0 prints `DEPLOY INCOMPLETE` and exits 2, not `DEPLOY OK`. | The @@TRANCOUNT page: `BEGIN TRANSACTION` increments it, and `COMMIT TRANSACTION` or `ROLLBACK TRANSACTION` bring it down. A script that opens a transaction and never commits has run every batch and kept nothing the transaction covers, so the tool does not say OK. The tool does not confirm what the server does when the connection then closes. |
+| A `--` comment ends at a carriage return, a line feed, or both. A lone CR ends it. | The comment page: "Comments inserted with -- are terminated by a new line, which is specified with a carriage return character (U+000A), line feed character (U+000D), or a combination of the two." The page swaps the two code points (U+000A is the line feed), so the tool follows the words. |
+| `[ ... ]` and `" ... "` open a name that can hold `--`, `/*`, `'` and a `GO`-looking line. A `]]` inside brackets and a `""` inside double quotes are escapes. A left bracket needs no escape. | The identifiers page: "If the identifier itself contains a right bracket ( ] ), escape it by doubling it ( ]] ). A left bracket ( [ ) doesn't require escaping." and "If the identifier itself contains a double quotation mark, escape it by doubling it ( "" )." |
+| A stacked statement after a bracketed name or after a lone-CR comment is scanned like any other code: `SET NOEXEC ON` is refused and `BEGIN TRAN` is seen. A comma list such as `SET NOCOUNT, NOEXEC ON` is scanned too. | The SET statements page says one `SET` can name several options, so a refused option can follow a comma. |
 | A line that starts with `:` and a letter (a sqlcmd directive) is refused. | Directives such as `:setvar` belong to sqlcmd. This tool does not run sqlcmd scripts. |
 | A script with a NUL character is refused with exit 64. | UTF-16 without a BOM, and UTF-32, decode to text full of NULs. The driver may read the SQL as null-terminated text and stop at the first one. I did not test that. |
 | Line endings inside a batch are sent unchanged. | A CRLF inside a multi-line string literal is part of the data. |
@@ -186,6 +190,11 @@ Pages cited:
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-fmtonly-transact-sql>
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-implicit-transactions-transact-sql>
 - <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/begin-transaction-transact-sql>
+- <https://learn.microsoft.com/en-us/sql/t-sql/functions/trancount-transact-sql> (`BEGIN TRANSACTION` increments `@@TRANCOUNT`; `COMMIT TRANSACTION` decrements it; `ROLLBACK TRANSACTION` sets it to 0.)
+- <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/comment-transact-sql> (`--` comments end at a carriage return, a line feed, or both.)
+- <https://learn.microsoft.com/en-us/sql/relational-databases/databases/database-identifiers> (`]]` and `""` escapes; double-quote delimiters need `QUOTED_IDENTIFIER ON`.)
+- <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-statements-transact-sql> ("SET QUOTED_IDENTIFIER, ANSI_NULLS ON sets both"; one `SET` can name several options.)
+- <https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-1505-database-engine-error> (The server prints the duplicate key value in its message: "The duplicate key value is %ls." The tool masks that value when the batch holds a literal. The parenthesised form `(value)` of Msg 2601 and 2627 is what I expect from those messages. I did not see it on a real server, and no Microsoft page I found quotes it.)
 - <https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility>
 - <https://learn.microsoft.com/en-us/ssms/f1-help/database-engine-query-editor-sql-server-management-studio>
 - <https://learn.microsoft.com/en-us/sql/connect/odbc/dsn-connection-string-attribute> (`Encrypt` defaults to `yes` from driver 18 and to `no` before. The tool writes `Encrypt=yes` out.)
@@ -210,16 +219,23 @@ A bad flag is named. Its value is not echoed:
 
 ```
 $ python sqldeploy.py demo_ok.sql --split-only --password hunter2
-error: unrecognized arguments: --password (1 more not shown, in case it is a secret)
+error: unrecognized arguments: --password (1 more not shown, in case one is a secret)
 (exit 64)
 ```
 
-A string literal in a script is masked in the summary:
+A string literal in a script is masked in the summary. The sample `cred.sql`:
+
+```
+CREATE LOGIN [svc_synth] WITH PASSWORD = 'Sup3rS3cret!x'
+GO
+SELECT 1
+GO
+```
 
 ```
 $ python sqldeploy.py cred.sql --split-only
 cred.sql: 2 batch(es), 2 with statements
-  batch 1 (lines 1-1): 64 chars: CREATE LOGIN [svc_synth] WITH PASSWORD = '***'
+  batch 1 (lines 1-1): 57 chars: CREATE LOGIN [svc_synth] WITH PASSWORD = '***'
   batch 2 (lines 3-3): 9 chars: SELECT 1
 
 SPLIT ONLY - no connection was made.
@@ -228,6 +244,27 @@ SPLIT ONLY - no connection was made.
 Every parser sets `allow_abbrev=False`. The self-test pins that `--app`, `--appl`, `--ap` and `--a` are
 refused before any connection opens, that `--apply=1` is refused, that a second path is refused, and that
 `--sel` does not become `--self-test`.
+
+A stacked statement behind a bracketed name is seen, not skipped. The sample `stacked.sql`:
+
+```
+SELECT [a]]b] FROM t; SET NOEXEC ON
+GO
+SELECT 2
+GO
+```
+
+```
+$ python sqldeploy.py stacked.sql --split-only
+stacked.sql: 2 batch(es), 2 with statements
+  line 1: REFUSED: batch 1 sets NOEXEC; that setting stops later batches from running while the server reports success, so a script must not set it
+
+nothing was sent to any server.
+(exit 1)
+```
+
+The same refusal fires when the `SET NOEXEC ON` follows a `--` comment that ends in a lone carriage
+return (`-- note<CR>SET NOEXEC ON<CR>GO<CR>`), because that comment ends at the CR.
 
 A `GO` that hides inside a comment:
 
@@ -265,8 +302,11 @@ nothing was sent to any server.
 | A bad flag value is not echoed | `--self-test` and the real run above |
 | No password option | `--self-test` checks the connection string carries no `UID` or `PWD`. The tool's own source reads no environment variable. |
 | A close error, Ctrl+C and a failure on run 2 of `GO N` | `--self-test`: a fake connection whose `close()` raises, a fake batch that raises `KeyboardInterrupt`, and a fake batch that fails on its second run |
-| The real `pyodbc` connect path | Two real runs in a scratch venv with `pyodbc` 5.3.0 and `ODBC Driver 17 for SQL Server`. Pointed at `tcp:127.0.0.1,1`, the driver was refused. Pointed at a local socket that accepts and closes at once, the driver failed in the handshake. Both times the tool exited 3 and ran nothing. |
-| UTF-16 and UTF-8 BOM scripts | `--self-test` |
+| The real `pyodbc` connect path | Two real runs on Windows (repeated on 2026-11-11) in a scratch venv with `pyodbc` 5.5.0 and `ODBC Driver 17 for SQL Server`. Pointed at `tcp:127.0.0.1,1`, the driver was refused. Pointed at a local socket that accepts and closes at once, the driver failed in the handshake. Both times the tool exited 3 and ran nothing. |
+| UTF-16 and UTF-8 BOM scripts | `--self-test`, at the decode level and end to end through `main()` |
+| A lone CR ends a `--` comment; bracketed and double-quoted names hide `--`, `/*`, `'` and `GO`; a stacked `SET NOEXEC ON` or `BEGIN TRAN` after them is seen | `--self-test`: the lexer section, the cases marked `pinned defect` among them |
+| An open transaction at the end is not reported OK | `--self-test`: a fake cursor counts `BEGIN TRAN` and `COMMIT`; an uncommitted script exits 2, a committed one exits 0, and a failing count query exits 2 |
+| A duplicate key value in parentheses is masked | `--self-test`: a fake server message in the Msg 2627 shape |
 
 The self-test writes small files in directories named `sqldeploy-test-*` under the system temp
 directory, and removes them. Nothing else in the tool writes a file. Only `--apply` writes to a server.
@@ -281,7 +321,13 @@ name, the driver name not validated, literal masking removed, an unknown flag va
 transaction note removed, the GO cap removed, the NUL check removed, and Ctrl+C not caught. You cannot
 reproduce the run from this repo alone.
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (910 statements, 212
+That run was made before the lexer work (lone CR, bracketed and double-quoted names) and before the
+open-transaction check, so it does not cover them. For those I made five single edits by hand and ran the
+self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), no `]]` escape (2 failed),
+`--` no longer starting a comment (21 failed), `[` no longer opening a name (13 failed), and the
+open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (1 failed).
+
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (983 statements, 242
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -311,6 +357,12 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A script with `BEGIN TRANSACTION` is not rolled back or committed by this tool.** After a failure
   the tool closes the connection. I did not confirm on a live server that this ends an open transaction.
   The message names the batches that hold the statement and says the commit count may be too high.
+  After a clean run, `--apply` asks the server for `@@TRANCOUNT` and exits 2 if it is above 0. The
+  count query itself ran only against the fake cursor. A transaction opened inside an `EXEC` string is
+  counted by the server, so it is caught here too.
+- **An error that the driver reports only while rows stream may not be seen.** `--apply` drains each
+  batch with `nextset()`. A real server could raise a late error in a way that call does not surface,
+  and the run would then print `DEPLOY OK`. A fake cursor cannot show this either way.
 - **Ctrl+C and a failed close.** Ctrl+C during `--apply` prints the unexpected-error message. It does
   not say how many batches ran. An error while closing the connection prints a warning on stderr. The
   exit status then reflects the deploy, not the close.
@@ -332,9 +384,33 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   script, even inside a comment, as a parameter marker. If it does, a legitimate script gets a false
   `PARSE ERROR`. That is the safe direction.
 - **Masking is a best effort.** A string literal is masked in batch summaries. Quoted text in a server
-  message is masked when the batch holds a literal. I did not test this against real server messages.
-  Bracketed names are shown. A secret in a comment is blanked, not printed.
-- **`--self-test` and `--split-only` ignore some flags.** `--self-test` ignores every other argument.
+  message is masked when the batch holds a literal, and so is the value in `The duplicate key value is
+  (...)`. I did not test this against real server messages. Bracketed names are shown. A secret in a
+  comment is blanked, not printed. Exceptions that are not driver errors are printed as they come, with
+  no masking. A secret typed as an unknown flag name (`--SuperSecret99`) is echoed, because the error
+  names unknown flags. Do not put a secret in a flag name.
+- **A `--` comment ends only at CR or LF.** The tool follows the comment page. Unicode line separators
+  (U+2028, U+2029, U+0085), vertical tab and form feed do not end it here. SQL Server, `sqlcmd` or SSMS
+  may treat them differently. I did not test that. If one does, a `SET NOEXEC ON` after such a character
+  is hidden from the scan.
+- **A lone CR counts as a line break in reported line numbers.** In a file that uses CR alone, each CR
+  adds one to the line number. SSMS may count lines differently for such a file.
+- **A double-quoted name is a string literal when `QUOTED_IDENTIFIER` is OFF.** The identifiers page says
+  so. The tool treats double-quoted text as masked either way. That is the safe direction.
+- **A `GO` after a block comment on the same line is not a `GO` line here.** `SELECT 1 /* a */ GO` stays
+  one batch with the text `SELECT 1 GO`. The server reads that as an alias, and `sqlcmd` may split it.
+  I did not test what `sqlcmd` does.
+- **Text inside `EXEC` and `sp_executesql` strings is not parsed or scanned.** A syntax error in `@sql`
+  still gives `parses clean` for the batch, and `parses clean` means the outer batch only. A refused
+  `SET`, such as `SET NOEXEC ON` inside `EXEC('...')`, is not seen. I did not check whether such a `SET`
+  stays in effect after the `EXEC` returns.
+- **`SET STATISTICS PARSE` is not in the refused list.** I did not check its semantics.
+- **Python treats VT, FF, FS, GS, RS, US, NEL and NBSP as whitespace.** A batch that holds only those
+  characters counts as empty and is skipped.
+- **Exit 1 has two meanings.** A real finding and a driver error during the preview both exit 1, and an
+  uncaught Python exception exits 1 as well. A calling script cannot tell them apart by the code.
+- **`--self-test` and `--split-only` ignore some flags.** `--self-test` ignores a path and the valid
+  flags next to it, but an unknown flag or a flag without its value is refused first (exit 64).
   `--split-only` ignores `--odbc-driver` and `--trust-server-certificate`.
 - **One pragma.** 100 percent branch coverage depends on `# pragma: no branch` on the `__main__` guard.
 - **The mutation harness is not shipped.** The mutation result above cannot be reproduced from this repo.
