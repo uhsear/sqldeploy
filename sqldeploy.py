@@ -51,9 +51,12 @@ COMMENTS_ONLY = "(comments only)"
 MAX_GO_COUNT = 10000    # a larger GO count is refused, not run that many times
 MASK = "***"
 
-# quoted: the batch holds a string literal. tran: it holds BEGIN TRANSACTION.
+# quoted: the batch holds a string or hex literal. tran: it holds BEGIN
+# TRANSACTION. apos: its string literals that contain an apostrophe, with
+# doubled quotes undoubled and white space squeezed, as a server may echo them.
 Batch = collections.namedtuple(
-    "Batch", "index first_line last_line text empty summary repeat quoted tran")
+    "Batch", "index first_line last_line text empty summary repeat quoted tran "
+             "apos")
 
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 # GO as a word at the start of a line. GOTO, GO_1 and GO5 are not GO.
@@ -72,6 +75,8 @@ _MODE_RE = re.compile(
 _TRAN_RE = re.compile(r"\bBEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?\b",
                       re.IGNORECASE)
 _QUOTED_DETAIL_RE = re.compile(r"'(?:[^']|'')*'")
+# A hex literal of four bytes or more: a password hash, a SID or a key blob.
+_HEX_RE = re.compile(r"(?<![\w@#$])0[xX][0-9A-Fa-f]{8,}")
 # Msg 2601 and 2627 print the key value in parentheses, not in quotes.
 _KEY_DETAIL_RE = re.compile(r"(duplicate key value is )\(.*\)\.", re.IGNORECASE)
 _FLAG_NAME_RE = re.compile(r"--[A-Za-z][A-Za-z0-9-]{0,39}\Z")
@@ -195,20 +200,60 @@ def _code_only(visible):
 
 
 def _mask_literals(visible):
-    """Replace the text of each string literal with ***, so a secret is not echoed.
+    """Replace string literal text and long hex literals with ***, so a secret is not echoed.
 
     Bracketed names stay: they are identifiers, not data.
     """
     out = []
+    code = []
     masked = False
     for c, quote, role in _walk(visible):
+        if role == "code":
+            code.append(c)
+            masked = False
+            continue
+        out.append(_HEX_RE.sub(MASK, "".join(code)))
+        del code[:]
         if role != "body" or quote == "[":
             out.append(c)
             masked = False
         elif not masked:
             out.append(MASK)
             masked = True
+    out.append(_HEX_RE.sub(MASK, "".join(code)))
     return "".join(out)
+
+
+def _apostrophe_literals(visible):
+    """String literals that contain an apostrophe, as the server would echo them.
+
+    A doubled quote inside a literal is one apostrophe. The server may print
+    it undoubled ('it's'), which the quote-pair mask in server_detail cannot
+    follow, so server_detail replaces these whole.
+    """
+    found = []
+    state = {"cur": None, "inside": False, "closed": None}
+
+    def done():
+        cur = state["cur"]
+        if cur is not None and "'" in cur:
+            found.append(" ".join(cur.split()))
+        state.update(cur=None, inside=False, closed=None)
+
+    for c, quote, role in _walk(visible):
+        if quote not in ("'", '"'):
+            done()
+        elif role == "body":
+            state["cur"] += c
+        elif state["inside"]:
+            state.update(inside=False, closed=quote)
+        elif state["closed"] == quote:
+            state.update(cur=state["cur"] + quote, inside=True, closed=None)
+        else:
+            done()
+            state.update(cur="", inside=True)
+    done()
+    return tuple(found)
 
 
 def server_detail(exc, batch):
@@ -218,7 +263,10 @@ def server_detail(exc, batch):
     """
     text = " ".join(str(exc).split())
     if batch.quoted:
+        for literal in batch.apos:
+            text = text.replace("'%s'" % literal, "'%s'" % MASK)
         text = _QUOTED_DETAIL_RE.sub("'%s'" % MASK, text)
+        text = _HEX_RE.sub(MASK, text)
         text = _KEY_DETAIL_RE.sub(r"\1(%s)." % MASK, text)
     return one_line(text, DETAIL_WIDTH)
 
@@ -256,7 +304,8 @@ def split_script(text):
             code = _code_only(visible_text)
             batches.append(Batch(index, first, last_line, body, empty,
                                  summary, repeat, masked != visible_text,
-                                 bool(_TRAN_RE.search(code))))
+                                 bool(_TRAN_RE.search(code)),
+                                 _apostrophe_literals(visible_text)))
             if _PARSEONLY_RE.search(code):
                 problems.append((first, "batch %d mentions PARSEONLY; the "
                                  "setting takes effect at parse time, so a "
@@ -1102,6 +1151,28 @@ def self_test():
           "a literal that spans lines is masked as one")
     b, p = split_script("SELECT ''\nGO\nSELECT 1\nGO\n")
     check(not b[0].quoted and not b[1].quoted, "an empty literal or none is not quoted")
+    b, p = split_script("CREATE LOGIN [svc] WITH PASSWORD = 0x0200A1B2C3D4E5F6 HASHED, SID = 0x1234\nGO\n")
+    check(b[0].summary == "CREATE LOGIN [svc] WITH PASSWORD = *** HASHED, SID = 0x1234" and b[0].quoted,
+          "a long hex literal is masked in the batch summary, a short one stays  <-- pinned defect")
+    b, p = split_script("SELECT [c0x0200A1B2C3D4], c0x0200A1B2C3D4, '0x0200A1B2C3D4' 0X0200a1b2\nGO\n")
+    check(b[0].summary == "SELECT [c0x0200A1B2C3D4], c0x0200A1B2C3D4, '***' ***",
+          "hex inside a name or a word stays, hex after a literal is masked, the case is free")
+    b, p = split_script("SELECT CAST(N'pa''ss1' AS int), \"x'y\", 'a'\"b'c\", 'it''s', [q'r], 'one''two''three'\nGO\n")
+    check(b[0].apos == ("pa'ss1", "x'y", "b'c", "it's", "one'two'three"),
+          "literals with an apostrophe are kept undoubled, in order, other literals and names are not")
+    b, p = split_script("SELECT 'a\n   b''c'\nGO\n")
+    check(b[0].apos == ("a b'c",), "a literal that spans lines is kept with its white space squeezed")
+    b, p = split_script("SELECT CAST(N'pa''ss1' AS int)\nGO\n")
+    out = server_detail(_FakeError("Conversion failed when converting the nvarchar value "
+                                   "'pa'ss1' to data type int."), b[0])
+    check("ss1" not in out and "pa" not in out and "'***'" in out,
+          "a literal echoed with its apostrophe undoubled is masked whole  <-- pinned defect")
+    out = server_detail(_FakeError("Incorrect syntax near 0x0200A1B2C3D4E5F6."), b[0])
+    check("0x0200" not in out and MASK in out, "a hex token in a server message is masked")
+    b, p = split_script("CREATE CERTIFICATE c FROM BINARY = 0x3082010A0282010100\nGO\n")
+    out = server_detail(_FakeError("Incorrect syntax near '0x3082010A0282010100'."), b[0])
+    check(b[0].quoted and "0x3082" not in out,
+          "a batch with only a hex literal is quoted, so a server echo of it is masked  <-- pinned defect")
 
     # ---- decoding
     check(decode_sql(b"SELECT 1") == "SELECT 1", "plain UTF-8 decodes")

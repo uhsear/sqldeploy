@@ -21,8 +21,9 @@ trusts neither.
 - A `GO` it cannot split with certainty is an error, not a guess.
 - A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_*` or `IMPLICIT_TRANSACTIONS` is an error. Those
   settings make later batches stop running while the server still says OK.
-- The text of a string literal is masked in every batch summary and in the server's error text for
-  that batch, so a password in your script does not reach a log.
+- The text of a string literal, and a hex literal of four bytes or more such as a `HASHED` password
+  value, is masked in every batch summary and in the server's error text for that batch, so a password
+  in your script does not reach a log. Limits lists what is not masked.
 
 ## What exists already
 
@@ -66,13 +67,15 @@ PASS  a GO line inside a block comment is REFUSED  <-- pinned defect
 PASS  a prefix --app of --apply is REFUSED before any connection  <-- pinned defect
 ...
 PASS  a password literal is masked in the batch summary  <-- pinned defect
+PASS  a long hex literal is masked in the batch summary, a short one stays  <-- pinned defect
+PASS  a literal echoed with its apostrophe undoubled is masked whole  <-- pinned defect
 ...
 PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 ...
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 ...
 --------------------------------------------------------------------
-250 assertions, 0 failed
+257 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -298,7 +301,7 @@ nothing was sent to any server.
 | No batch is sent if `SET PARSEONLY ON` fails | `--self-test` |
 | Unknown and abbreviated arguments are refused | `--self-test` and the real runs above |
 | Summaries and the script path are printable ASCII | `--self-test`: a bracketed name with an accented letter and an escape character, a DEL character, and a script path with an accented letter. The error text of a bad argument holds only flag names that match `--[A-Za-z][A-Za-z0-9-]*`. |
-| No script literal is printed | `--self-test`: a password literal, a literal that spans lines, and a server message that repeats a literal |
+| No script literal is printed | `--self-test`: a password literal, a literal that spans lines, a hex literal, and server messages that repeat a literal, with its apostrophe doubled or not, and a hex token |
 | A bad flag value is not echoed | `--self-test` and the real run above |
 | No password option | `--self-test` checks the connection string carries no `UID` or `PWD`. The tool's own source reads no environment variable. |
 | A close error, Ctrl+C and a failure on run 2 of `GO N` | `--self-test`: a fake connection whose `close()` raises, a fake batch that raises `KeyboardInterrupt`, and a fake batch that fails on its second run |
@@ -327,7 +330,7 @@ self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), 
 `--` no longer starting a comment (21 failed), `[` no longer opening a name (13 failed), and the
 open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (1 failed).
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (983 statements, 242
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1032 statements, 258
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -383,12 +386,32 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A question mark may confuse the driver.** I did not test whether the ODBC driver reads a `?` in a
   script, even inside a comment, as a parameter marker. If it does, a legitimate script gets a false
   `PARSE ERROR`. That is the safe direction.
-- **Masking is a best effort.** A string literal is masked in batch summaries. Quoted text in a server
-  message is masked when the batch holds a literal, and so is the value in `The duplicate key value is
-  (...)`. I did not test this against real server messages. Bracketed names are shown. A secret in a
-  comment is blanked, not printed. Exceptions that are not driver errors are printed as they come, with
-  no masking. A secret typed as an unknown flag name (`--SuperSecret99`) is echoed, because the error
-  names unknown flags. Do not put a secret in a flag name.
+- **Masking is a best effort.** A string literal, and a hex literal of four bytes or more, is masked in
+  batch summaries. Quoted text in a server message is masked when the batch holds a literal, and so is
+  the value in `The duplicate key value is (...)`. A literal that holds an apostrophe is also masked
+  when the server prints it with the apostrophe undoubled. I did not test any of this against real
+  server messages. Bracketed names are shown. A secret in a comment is blanked, not printed.
+  Exceptions that are not driver errors are printed as they come, with no masking. A secret typed as an
+  unknown flag name (`--SuperSecret99`) is echoed, because the error names unknown flags. Do not put a
+  secret in a flag name.
+- **Only quoted text and long hex are masked.** A hex literal shorter than four bytes is shown. A hex
+  literal in a server message is masked only when the batch holds a literal. A server message that
+  repeats a value from table data, such as the duplicate key value of an `INSERT ... SELECT`, is
+  printed as the server sent it, because the tool cannot know that the value is secret.
+- **Curly quotes are not string delimiters here.** Text between U+2018 and U+2019 is read as code, so a
+  literal inside them is not masked. I did not check how SQL Server reads those characters.
+- **A column named after a refused `SET` option is refused as a false positive.** `UPDATE t SET noexec = 1`
+  is read as `SET NOEXEC`. This is the safe direction, and it affects only columns named `noexec`,
+  `fmtonly` or `implicit_transactions`.
+- **The comma-list form is scanned for every refused option.** `SET a, b ON` is scanned for the
+  `SHOWPLAN` options too, although the SET statements page says the multi-option form does not apply to
+  statistics options. Refusing it is harmless.
+- **`DEPLOY OK` means no batch raised and no transaction was left open.** It does not show that the work
+  persisted. A script that ends in `ROLLBACK`, or that catches an error in `TRY...CATCH` without
+  `THROW`, prints `DEPLOY OK` and exits 0.
+- **A failure before the first batch uses the same message as a failure during a batch.** If the
+  cursor cannot be created after the connect, the tool still prints that some batches may already have
+  run and are committed, and exits 2. Nothing ran in that case.
 - **A `--` comment ends only at CR or LF.** The tool follows the comment page. Unicode line separators
   (U+2028, U+2029, U+0085), vertical tab and form feed do not end it here. SQL Server, `sqlcmd` or SSMS
   may treat them differently. I did not test that. If one does, a `SET NOEXEC ON` after such a character
