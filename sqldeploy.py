@@ -264,7 +264,9 @@ def server_detail(exc, batch):
     text = " ".join(str(exc).split())
     if batch.quoted:
         for literal in batch.apos:
-            text = text.replace("'%s'" % literal, "'%s'" % MASK)
+            # The server keeps the padding of a literal, which the squeeze above
+            # collapsed to one space, so allow one space inside each quote.
+            text = re.sub("' ?%s ?'" % re.escape(literal), "'%s'" % MASK, text)
         text = _QUOTED_DETAIL_RE.sub("'%s'" % MASK, text)
         text = _HEX_RE.sub(MASK, text)
         text = _KEY_DETAIL_RE.sub(r"\1(%s)." % MASK, text)
@@ -1162,6 +1164,15 @@ def self_test():
           "literals with an apostrophe are kept undoubled, in order, other literals and names are not")
     b, p = split_script("SELECT 'a\n   b''c'\nGO\n")
     check(b[0].apos == ("a b'c",), "a literal that spans lines is kept with its white space squeezed")
+    b, p = split_script("SELECT '  Sup3r''Secret!  '\nGO\nSELECT 'Sup3r''Secret! '\nGO\n")
+    out = server_detail(_FakeError("Incorrect syntax near '  Sup3r'Secret!  '."), b[0])
+    check(out == "Incorrect syntax near '***'.",
+          "a padded literal echoed with its apostrophe undoubled is masked whole  <-- pinned defect")
+    out = server_detail(_FakeError("Incorrect syntax near 'Sup3r'Secret! '."), b[1])
+    check("Secret" not in out and "'***'" in out,
+          "a literal with only trailing padding is masked whole  <-- pinned defect")
+    out = server_detail(_FakeError("Incorrect syntax near ' Sup3r''Secret! '."), b[0])
+    check("Secret" not in out, "a padded literal echoed with its apostrophe doubled is masked")
     b, p = split_script("SELECT CAST(N'pa''ss1' AS int)\nGO\n")
     out = server_detail(_FakeError("Conversion failed when converting the nvarchar value "
                                    "'pa'ss1' to data type int."), b[0])

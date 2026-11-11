@@ -23,7 +23,8 @@ trusts neither.
   settings make later batches stop running while the server still says OK.
 - The text of a string literal, and a hex literal of four bytes or more such as a `HASHED` password
   value, is masked in every batch summary and in the server's error text for that batch, so a password
-  in your script does not reach a log. Limits lists what is not masked.
+  in your script does not reach a log. This is a best effort, not a guarantee: Limits lists what is not
+  masked, and a reader of this bullet alone should not take it as complete.
 
 ## What exists already
 
@@ -69,13 +70,14 @@ PASS  a prefix --app of --apply is REFUSED before any connection  <-- pinned def
 PASS  a password literal is masked in the batch summary  <-- pinned defect
 PASS  a long hex literal is masked in the batch summary, a short one stays  <-- pinned defect
 PASS  a literal echoed with its apostrophe undoubled is masked whole  <-- pinned defect
+PASS  a padded literal echoed with its apostrophe undoubled is masked whole  <-- pinned defect
 ...
 PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 ...
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 ...
 --------------------------------------------------------------------
-257 assertions, 0 failed
+260 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -330,7 +332,7 @@ self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), 
 `--` no longer starting a comment (21 failed), `[` no longer opening a name (13 failed), and the
 open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (1 failed).
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1032 statements, 258
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1039 statements, 258
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -389,7 +391,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **Masking is a best effort.** A string literal, and a hex literal of four bytes or more, is masked in
   batch summaries. Quoted text in a server message is masked when the batch holds a literal, and so is
   the value in `The duplicate key value is (...)`. A literal that holds an apostrophe is also masked
-  when the server prints it with the apostrophe undoubled. I did not test any of this against real
+  when the server prints it with the apostrophe undoubled, with or without a space at either end of
+  the literal. I did not test any of this against real
   server messages. Bracketed names are shown. A secret in a comment is blanked, not printed.
   Exceptions that are not driver errors are printed as they come, with no masking. A secret typed as an
   unknown flag name (`--SuperSecret99`) is echoed, because the error names unknown flags. Do not put a
@@ -419,7 +422,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A lone CR counts as a line break in reported line numbers.** In a file that uses CR alone, each CR
   adds one to the line number. SSMS may count lines differently for such a file.
 - **A double-quoted name is a string literal when `QUOTED_IDENTIFIER` is OFF.** The identifiers page says
-  so. The tool treats double-quoted text as masked either way. That is the safe direction.
+  so. The tool treats double-quoted text as masked either way in the batch summary. That is the safe
+  direction. A server message that repeats double-quoted text is not masked.
 - **A `GO` after a block comment on the same line is not a `GO` line here.** `SELECT 1 /* a */ GO` stays
   one batch with the text `SELECT 1 GO`. The server reads that as an alias, and `sqlcmd` may split it.
   I did not test what `sqlcmd` does.
@@ -430,6 +434,27 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **`SET STATISTICS PARSE` is not in the refused list.** I did not check its semantics.
 - **Python treats VT, FF, FS, GS, RS, US, NEL and NBSP as whitespace.** A batch that holds only those
   characters counts as empty and is skipped.
+- **A line that starts with the word `go` inside an open comment or string is refused.** Prose such as
+  `go live Monday` on its own line in a block comment or a multi-line literal is read as a `GO` line.
+  This is a safe false refusal and exits 1. I ran it.
+- **`-hSOMETHING` prints help and exits 0.** argparse reads a short flag glued to `-h` as `-h`, so the
+  tool does not refuse it as an unknown argument. I ran `-hFOO`. Nothing is sent to a server.
+- **A `GO` count of ten or more digits is refused even when its value is small.** `GO 0000000001` exits
+  1 with the count message, because the check uses the digit count.
+- **Driver errors print as a Python tuple.** The text reads like `('08001', '[08001] ...')`. This is
+  cosmetic.
+- **A script with one multi-megabyte string literal splits slowly.** A literal of 400,000 characters
+  took about 3 seconds on Windows. Time grows faster than the length.
+- **`SET ANSI_DEFAULTS ON` and `SET ROWCOUNT n` are not refused.** The SET ANSI_DEFAULTS page says the
+  first turns `IMPLICIT_TRANSACTIONS` on, and an open transaction is reported only at the end as
+  `DEPLOY INCOMPLETE`. The tool does not detect `ROWCOUNT`. I did not run either against a server.
+- **A server message that repeats a literal without single quotes is printed unmasked.** SQL Server does
+  not normally echo a literal that way. I made the test message up.
+- **`--apply` sets no query timeout.** A batch that blocks, for example behind a lock, waits until you
+  press Ctrl+C, which exits 2.
+- **The text `(comments only)` as the whole of a batch is read as an empty batch** and skipped under
+  `--apply`. That text is not valid T-SQL.
+- **Self-test labels that start with an acronym** (`GO`, `CRLF`) are capitalised. This is a style nit.
 - **Exit 1 has two meanings.** A real finding and a driver error during the preview both exit 1, and an
   uncaught Python exception exits 1 as well. A calling script cannot tell them apart by the code.
 - **`--self-test` and `--split-only` ignore some flags.** `--self-test` ignores a path and the valid
@@ -437,6 +462,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   `--split-only` ignores `--odbc-driver` and `--trust-server-certificate`.
 - **One pragma.** 100 percent branch coverage depends on `# pragma: no branch` on the `__main__` guard.
 - **The mutation harness is not shipped.** The mutation result above cannot be reproduced from this repo.
+  The counts are a record from earlier self-test versions. For example, the edit "`[` no longer opens a
+  name" now fails 14 assertions, not the 13 quoted, so the 143-edit figure cannot be checked from here.
 - **Windows authentication only.** On Linux this means Kerberos through the ODBC driver. I did not test it.
 - **The default driver name is `ODBC Driver 18 for SQL Server`.** If you have another version, pass
   `--odbc-driver`.
