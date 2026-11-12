@@ -66,6 +66,7 @@ PASS  each batch records its own line range
 ...
 PASS  a GO line inside a block comment is REFUSED  <-- pinned defect
 PASS  GO after a statement on the same line is REFUSED, not run as text  <-- pinned defect
+PASS  GO followed by a semicolon after code on the same line is REFUSED  <-- pinned defect
 ...
 PASS  a prefix --app of --apply is REFUSED before any connection  <-- pinned defect
 ...
@@ -80,7 +81,7 @@ PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 ...
 --------------------------------------------------------------------
-272 assertions, 0 failed
+274 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -173,7 +174,7 @@ The rules, with the source of each:
 | `GO;` is refused. | The GO page: "Do not use a semicolon as a statement terminator after GO." |
 | The tool strips `GO` and sends each batch alone. | The GO page: "Applications based on the ODBC or OLE DB APIs receive a syntax error if they try to execute a GO command." |
 | Block comments nest. `/*` inside a comment opens a second level. | The block-comment page: "Nested comments are supported." |
-| A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that ends a line of code or follows a comment on its line, such as `SELECT 1 /* a */ GO`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
+| A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that ends a line of code or follows a comment on its line, such as `SELECT 1 /* a */ GO` or `SELECT 1 GO;`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
 | A script that sets or names `PARSEONLY` in code is refused. A mention inside a comment or a string is not. | The PARSEONLY page: "The setting of SET PARSEONLY is set at parse time and not at execute or run time." I could not test a real server. A script that sets it could change the mode the preview relies on. |
 | A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_ALL`, `SHOWPLAN_TEXT`, `SHOWPLAN_XML` or `IMPLICIT_TRANSACTIONS` is refused. | The NOEXEC page: SQL Server "parses and compiles each batch of Transact-SQL statements but does not execute them". The SHOWPLAN_ALL page: "Transact-SQL statements are not executed". The FMTONLY page: a rowset comes back "without any data rows". The IMPLICIT_TRANSACTIONS page: a statement starts a transaction that you must end with `COMMIT` or `ROLLBACK`. After any of these a deploy could print `DEPLOY OK` and have changed nothing. |
 | A script that holds `BEGIN TRANSACTION` is accepted. A failure message then carries a note. | The BEGIN TRANSACTION page: an explicit transaction ends only with `COMMIT` or `ROLLBACK`. Under `autocommit` a batch inside one is not committed on its own, so the "already committed" count may be too high. The note names the batches. |
@@ -356,9 +357,9 @@ That run was made before the lexer work (lone CR, bracketed and double-quoted na
 open-transaction check, so it does not cover them. For those I made five single edits by hand and ran the
 self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), no `]]` escape (2 failed),
 `--` no longer starting a comment (23 failed), `[` no longer opening a name (14 failed), and the
-open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (1 failed).
+open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (2 failed).
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1079 statements, 264
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1083 statements, 264
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -459,8 +460,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A double-quoted name is a string literal when `QUOTED_IDENTIFIER` is OFF.** The identifiers page says
   so. The tool treats double-quoted text as masked either way in the batch summary. That is the safe
   direction. A server message that repeats double-quoted text is not masked.
-- **A line of code that ends in the word `go` is refused.** `SELECT 1 /* a */ GO` is refused because the
-  GO page says a statement cannot share a line with `GO`. `SELECT x AS go` and `FROM t go` (an alias) are
+- **A line of code that ends in the word `go` is refused.** `SELECT 1 /* a */ GO` and `SELECT 1 GO;` are refused because
+  the GO page says a statement cannot share a line with `GO`. `SELECT x AS go` and `FROM t go` (an alias) are
   refused too, which is a false refusal in the safe direction. `dbo.go`, `[go]` and `go` inside a
   literal are not refused.
 - **Text inside `EXEC` and `sp_executesql` strings is not parsed or scanned.** A syntax error in `@sql`
@@ -501,7 +502,7 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **The mutation harness is not shipped.** The mutation result above cannot be reproduced from this repo.
   The counts are a record of earlier self-test versions: the `--` edit failed 21 assertions then and 23
   now, and the `[` edit failed 13 then and 14 now. The 143-edit figure cannot be checked from here. Only
-  the five hand edits can be rerun.
+  the six hand edits can be rerun.
 - **Only the listed statements are flagged as stacked.** The tool finds `SET NOEXEC`, `FMTONLY`,
   `SHOWPLAN_*`, `IMPLICIT_TRANSACTIONS`, `PARSEONLY`, `BEGIN TRAN`, sqlcmd directives and `$(var)`, also
   after a bracketed name, a quoted name or a lone-CR comment. It does not flag any other second
@@ -519,6 +520,19 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **Windows authentication only.** On Linux this means Kerberos through the ODBC driver. I did not test it.
 - **The default driver name is `ODBC Driver 18 for SQL Server`.** If you have another version, pass
   `--odbc-driver`.
+- **A script that turns a refused `SET` option OFF is refused too.** The tool reads the option name, not
+  the ON or OFF word, so `SET NOEXEC OFF` and `SET IMPLICIT_TRANSACTIONS OFF` exit 1 with the same wording.
+- **A GO after a lone carriage return is split as a `GO` line.** The comment page documents a lone CR only
+  for `--` comments. I did not check that sqlcmd or SSMS ends a line at a lone CR for `GO`.
+- **The success path of the ODBC connection never met a real server.** Connect, `SET PARSEONLY`, the
+  batches and `nextset()` ran only against a fake cursor. The two real-driver runs (a refused port and an
+  accept-and-close socket) need a scratch venv with `pyodbc` and an ODBC driver. They are not in this repo.
+- **A connection failure prints the driver message as it came.** The text can be long and can name the
+  server and the driver. A Windows-authentication connection string holds no password.
+- **A partial server echo of a literal with an apostrophe is partly masked.** If SQL Server prints a
+  truncated copy of such a literal, the part after the apostrophe can show, because the whole-literal
+  mask needs the full literal. Example: `'it''s Sup3rS3cret'` echoed as `'it's Sup3'` prints `'***'s Sup3'`.
+- **The Ctrl+F5 shortcut for SSMS Parse** comes from the SSMS Query Editor page, which I read on 2026-11-11.
 - **Python 3.8 and earlier are untested.**
 
 ## Contributing

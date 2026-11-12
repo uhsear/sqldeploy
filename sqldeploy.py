@@ -62,9 +62,10 @@ _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 # GO as a word at the start of a line. GOTO, GO_1 and GO5 are not GO.
 _GO_RE = re.compile(r"^\s*GO(?![\w@#$])(.*)$", re.IGNORECASE)
 # GO as the last word of a line that holds other code or a leading comment.
+# One trailing semicolon is allowed, so "SELECT 1 GO;" is seen too.
 # Run on comment-free, literal-free text. Dots and brackets before GO mean a
 # name (dbo.go), so they do not match.
-_GO_AFTER_RE = re.compile(r"(?<![\w@#$.\]])GO(?![\w@#$])(?:\s+[0-9]+)?\s*$",
+_GO_AFTER_RE = re.compile(r"(?<![\w@#$.\]])GO(?![\w@#$])(?:\s+[0-9]+)?\s*;?\s*$",
                           re.IGNORECASE)
 _GO_TAIL_RE = re.compile(r"^(?:\s+([0-9]+))?\s*(?:--.*)?$")
 _PARSEONLY_RE = re.compile(r"\bPARSEONLY\b", re.IGNORECASE)
@@ -937,6 +938,12 @@ def self_test():
     b, p = split_script("SELECT 1 GO\nSELECT 2\n")
     check(len(b) == 1 and len(p) == 1 and p[0][0] == 1 and "GO follows code" in p[0][1],
           "GO after a statement on the same line is REFUSED, not run as text  <-- pinned defect")
+    b, p = split_script("SELECT 1 GO;\nSELECT 2\nGO\n")
+    check(len(p) == 1 and p[0][0] == 1 and "GO follows code" in p[0][1],
+          "GO followed by a semicolon after code on the same line is REFUSED  <-- pinned defect")
+    b, p = split_script("SELECT 1 GO 2;\nSELECT 2\nGO\n")
+    check(len(p) == 1 and p[0][0] == 1 and "GO follows code" in p[0][1],
+          "GO with a count and a semicolon after code is REFUSED  <-- pinned defect")
     b, p = split_script("SELECT 1 /* c */ GO\nDROP TABLE dbo.victim\nGO\n")
     check(len(p) == 1 and p[0][0] == 1,
           "GO after a block comment on a code line is REFUSED  <-- pinned defect")
