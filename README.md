@@ -21,7 +21,11 @@ trusts neither.
 - A `GO` it cannot split with certainty is an error, not a guess. That includes a `GO` that follows code or a
   comment on the same line.
 - A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_*` or `IMPLICIT_TRANSACTIONS` is an error. Those
-  settings make later batches stop running while the server still says OK.
+  settings make later batches stop running while the server still says OK. So is the same setting inside
+  an `EXEC('...')` string.
+- A batch that runs `EXEC('...')`, `EXEC (@sql)` or `sp_executesql` is an error unless you pass
+  `--allow-dynamic`. `SET PARSEONLY` does not read the text inside, so a typo there would pass the
+  check and fail during `--apply`. With the flag, the verdict line says the text was not parsed.
 - The text of a string literal, and a hex literal of four bytes or more such as a `HASHED` password
   value, is masked in every batch summary and in the server's error text for that batch, so a password
   in your script does not reach a log. This is a best effort, not a guarantee: Limits lists what is not
@@ -57,6 +61,9 @@ preview that happens before anything runs.
 
 ## Self-test
 
+This block is an excerpt. Each `...` stands for passing lines that are left out. Every line shown is
+verbatim from a run, and the last line is the real total.
+
 ```
 $ python sqldeploy.py --self-test
 sqldeploy self-test: no SQL Server, no ODBC, no network
@@ -80,9 +87,12 @@ PASS  a driver error (sqlstate, message) is masked from the message, not its tup
 PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 ...
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
+PASS  --apply of a script with EXEC text is REFUSED before any connection  <-- pinned defect
+PASS  --allow-dynamic checks, and the verdict says the EXEC text was not parsed  <-- pinned defect
+PASS  SET NOEXEC inside an EXEC string is REFUSED, even with --split-only  <-- pinned defect
 ...
 --------------------------------------------------------------------
-281 assertions, 0 failed
+305 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -127,6 +137,7 @@ python sqldeploy.py deploy.sql --server HOST --database DB --apply
 | `--database` | none | Database to run in. Required unless `--split-only`. |
 | `--odbc-driver` | `ODBC Driver 18 for SQL Server` | Name of the installed ODBC driver. `--split-only` accepts it and ignores it. |
 | `--trust-server-certificate` | off | Skip server certificate validation. `--split-only` accepts it and ignores it. |
+| `--allow-dynamic` | off | Accept a batch that runs `EXEC` with a parenthesis or a string, or `sp_executesql`. Without it such a batch is refused before any connection. With it the check line says `(dynamic SQL text not parsed)`. `--split-only` lists such a batch with `[dynamic SQL]` and needs no flag. |
 | `--split-only` | off | List the batches and exit. Cannot combine with `--apply`, `--server` or `--database`. |
 | `--apply` | off | Parse every batch, then run them. Without it nothing is written. |
 | `--self-test` | off | Run the offline assertions and exit. It ignores a path and the valid flags next to it. An unknown flag, or a flag that lacks its value, is still refused first with exit 64. |
@@ -178,6 +189,7 @@ The rules, with the source of each:
 | A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that ends a line of code or follows a comment on its line, such as `SELECT 1 /* a */ GO` or `SELECT 1 GO;`. The same holds when the line starts inside a multi-line string, double-quoted name or bracketed name and the closing quote comes before the `GO`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
 | A script that sets or names `PARSEONLY` in code is refused. A mention inside a comment or a string is not. | The PARSEONLY page: "The setting of SET PARSEONLY is set at parse time and not at execute or run time." I could not test a real server. A script that sets it could change the mode the preview relies on. |
 | A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_ALL`, `SHOWPLAN_TEXT`, `SHOWPLAN_XML` or `IMPLICIT_TRANSACTIONS` is refused. | The NOEXEC page: SQL Server "parses and compiles each batch of Transact-SQL statements but does not execute them". The SHOWPLAN_ALL page: "Transact-SQL statements are not executed". The FMTONLY page: a rowset comes back "without any data rows". The IMPLICIT_TRANSACTIONS page: a statement starts a transaction that you must end with `COMMIT` or `ROLLBACK`. After any of these a deploy could print `DEPLOY OK` and have changed nothing. |
+| A batch with `EXEC` followed by a parenthesis or a string, or with `sp_executesql`, is refused unless `--allow-dynamic` is given. A refused `SET` option or `PARSEONLY` inside such a batch's strings is refused too. | The PARSEONLY page says SQL Server "only parses the statement". The EXECUTE page documents `EXEC ( { @string_variable | [ N ]'tsql_string' } )` as a statement that runs a character string. Neither page says the string is parsed under PARSEONLY, so the tool does not assume it. |
 | A script that holds `BEGIN TRANSACTION` is accepted. A failure message then carries a note. | The BEGIN TRANSACTION page: an explicit transaction ends only with `COMMIT` or `ROLLBACK`. Under `autocommit` a batch inside one is not committed on its own, so the "already committed" count may be too high. The note names the batches. |
 | After the last batch, `--apply` runs `SELECT @@TRANCOUNT`. A value above 0 prints `DEPLOY INCOMPLETE` and exits 2, not `DEPLOY OK`. | The @@TRANCOUNT page: `BEGIN TRANSACTION` increments it, and `COMMIT TRANSACTION` or `ROLLBACK TRANSACTION` bring it down. A script that opens a transaction and never commits has run every batch and kept nothing the transaction covers, so the tool does not say OK. The tool does not confirm what the server does when the connection then closes. |
 | A `--` comment ends at a carriage return, a line feed, or both. A lone CR ends it. | The comment page: "Comments inserted with -- are terminated by a new line, which is specified with a carriage return character (U+000A), line feed character (U+000D), or a combination of the two." The page swaps the two code points (U+000A is the line feed), so the tool follows the words. |
@@ -256,6 +268,27 @@ SPLIT ONLY - no connection was made.
 Every parser sets `allow_abbrev=False`. The self-test pins that `--app`, `--appl`, `--ap` and `--a` are
 refused before any connection opens, that `--apply=1` is refused, that a second path is refused, and that
 `--sel` does not become `--self-test`.
+
+A batch that runs text built from a string is refused, because the parse check cannot read that text.
+The sample `dyn.sql`:
+
+```
+SELECT 1
+GO
+EXEC('SELEC 1')
+GO
+```
+
+```
+$ python sqldeploy.py dyn.sql --server h --database d
+dyn.sql: 2 batch(es), 2 with statements
+  batch 2 (lines 3-3): REFUSED: it runs text built from a string, EXEC with a parenthesis or a string, or sp_executesql. SET PARSEONLY does not read that text, so a typo in it would pass the check and fail during --apply, after earlier batches are committed
+
+nothing was sent to any server. Run again with --allow-dynamic if you accept that risk.
+(exit 1)
+```
+
+The refusal happens before any connection, so this run needs no server.
 
 A stacked statement behind a bracketed name is seen, not skipped. The sample `stacked.sql`:
 
@@ -339,6 +372,7 @@ nothing was sent to any server.
 | A lone CR ends a `--` comment; bracketed and double-quoted names hide `--`, `/*`, `'` and `GO`; a stacked `SET NOEXEC ON` or `BEGIN TRAN` after them is seen | `--self-test`: the lexer section, the cases marked `pinned defect` among them |
 | An open transaction at the end is not reported OK | `--self-test`: a fake cursor counts `BEGIN TRAN` and `COMMIT`; an uncommitted script exits 2, a committed one exits 0, and a failing count query exits 2 |
 | A duplicate key value in parentheses is masked, with or without a literal in the batch | `--self-test`: a fake server message in the Msg 2627 shape, for a batch with a literal and for an `INSERT ... SELECT` with none |
+| A batch with EXEC text is refused without `--allow-dynamic`, flagged in `--split-only`, and a refused `SET` inside the string is refused | `--self-test`: eight forms that count as dynamic and seven that do not, three refused settings inside strings, and the check and `--apply` runs through `main()` with a fake connection. The `dyn.sql` run above is real. |
 | A `$(Name)` reference is refused | `--self-test`: one in a bracketed name, one in a string, and three texts that are not references. The `var.sql` run above is real. |
 
 The self-test writes small files in directories named `sqldeploy-test-*` under the system temp
@@ -358,9 +392,9 @@ That run was made before the lexer work (lone CR, bracketed and double-quoted na
 open-transaction check, so it does not cover them. For those I made five single edits by hand and ran the
 self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), no `]]` escape (2 failed),
 `--` no longer starting a comment (23 failed), `[` no longer opening a name (14 failed), and the
-open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (2 failed). A seventh edit stopped the same-line `GO` check from walking a line that starts inside a quote (6 assertions failed).
+open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (2 failed). A seventh edit stopped the same-line `GO` check from walking a line that starts inside a quote (6 assertions failed). Three more edits cover the EXEC rule: a dynamic test that never matches (16 failed), the settings scan that does not read literals (4 failed), and the refusal removed (2 failed).
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1091 statements, 266
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1133 statements, 284
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -378,7 +412,7 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A clean preview means the Transact-SQL syntax is valid.** PARSEONLY does not compile. This tool does
   not promise that an unknown table or a permission problem shows up before `--apply`. The PARSEONLY
   page does not mention dynamic SQL, and I did not test it. Assume text inside `EXEC` or
-  `sp_executesql` strings is not checked.
+  `sp_executesql` strings is not checked. The tool refuses such a batch unless you pass `--allow-dynamic`.
 - **A driver error during the preview is reported as a parse error.** A non-syntax driver error that
   leaves the connection alive, such as a query timeout, shows as `PARSE ERROR` for that batch and exit
   1. Only a lost connection exits 3, because the closing `SET PARSEONLY OFF` fails too. The tool sets no connect or query
@@ -400,14 +434,16 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **Ctrl+C and a failed close.** Ctrl+C during `--apply` prints the unexpected-error message. It does
   not say how many batches ran. An error while closing the connection prints a warning on stderr. The
   exit status then reflects the deploy, not the close.
-- **The scan for refused `SET` options reads the script text.** `EXEC('SET PARSE' + 'ONLY OFF')` and
-  other text built at run time is not seen.
+- **The scan for refused `SET` options reads the script text.** In a batch with `EXEC` text it also
+  reads the string literals. `EXEC('SET PARSE' + 'ONLY OFF')` and other text built at run time is not
+  seen, and `--allow-dynamic` accepts that.
 - **`GO` inside a comment, string or bracketed name is refused.** A script that needs it must change.
   `GO /* note */` is also refused. A count above 10000 is refused.
 - **Encodings.** Scripts must be UTF-8, UTF-8 with BOM, or UTF-16 with BOM. A legacy code page such as
   cp1252 exits 64. A NUL character is refused, which also catches UTF-16 without a BOM and most UTF-32
-  files. A BOM in the middle of a file, left by joining files, is not removed. It can stop a `GO` line
-  from being seen.
+  files. A BOM in the middle of a file, left by joining files, is not removed. A BOM at the start of a `GO` line
+  is not seen as `GO`, and the tool refuses the script with "GO follows code", so it does not split
+  there. That is the safe direction, not a silent miss.
 - **Python decides what counts as whitespace.** A non-breaking space after `GO` is read as a space, and
   a batch of only Unicode whitespace counts as empty. `sqlcmd` may read them differently. Non-ASCII
   digits after `GO` are refused as malformed.
@@ -451,7 +487,9 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   run and are committed, and exits 2. Nothing ran in that case.
 - **A batch with hundreds of thousands of blank or comment-only lines splits very slowly.** The time
   grows with the square of the line count. 20,000 comment lines split in 0.7 s on Windows and 200,000
-  took about a minute. 50,000 indented lines inside one block comment took 32.8 s. The cause is the `^\s*:[A-Za-z]` directive scan over the comment-blanked text.
+  took about a minute. Indented blank lines are slower than comment lines: 20,000 took 3.3 s and 40,000
+  took 12.3 s on Windows (Python 3.13). So the 0.7 s figure covers comment lines only.
+  50,000 indented lines inside one block comment took 32.8 s. The cause is the `^\s*:[A-Za-z]` directive scan over the comment-blanked text.
 - **A `--` comment ends only at CR or LF.** The tool follows the comment page. Unicode line separators
   (U+2028, U+2029, U+0085), vertical tab and form feed do not end it here. SQL Server, `sqlcmd` or SSMS
   may treat them differently. I did not test that. If one does, a `SET NOEXEC ON` after such a character
@@ -465,10 +503,13 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   the GO page says a statement cannot share a line with `GO`. `SELECT x AS go` and `FROM t go` (an alias) are
   refused too, which is a false refusal in the safe direction. `dbo.go`, `[go]` and `go` inside a
   literal are not refused.
-- **Text inside `EXEC` and `sp_executesql` strings is not parsed or scanned.** A syntax error in `@sql`
-  still gives `parses clean` for the batch, and `parses clean` means the outer batch only. A refused
-  `SET`, such as `SET NOEXEC ON` inside `EXEC('...')`, is not seen. I did not check whether such a `SET`
-  stays in effect after the `EXEC` returns.
+- **Text inside `EXEC` and `sp_executesql` strings is never parsed.** A batch that runs it is refused
+  unless you pass `--allow-dynamic`. With the flag, a syntax error in the string still gives a clean
+  check, and the line says `(dynamic SQL text not parsed)`. A literal `SET NOEXEC ON` inside the string
+  is refused. Text built from variables or `+` is not seen. A `sp_executesql` written as a bracketed
+  name, `[sp_executesql]`, is not flagged. A procedure name in a variable, `EXEC @proc`, is not flagged.
+  A stored procedure call such as `EXEC dbo.proc1` is not flagged either, and the procedure body is not
+  read. I did not check whether a `SET` inside the string stays in effect after the `EXEC` returns.
 - **`SET STATISTICS PARSE` is not in the refused list.** I did not check its semantics.
 - **Python treats VT, FF, FS, GS, RS, US, NEL and NBSP as whitespace.** A batch that holds only those
   characters counts as empty and is dropped from the batch count, not listed as skipped.
@@ -489,8 +530,20 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **`SET ANSI_DEFAULTS ON` and `SET ROWCOUNT n` are not refused.** The SET ANSI_DEFAULTS page says the
   first turns `IMPLICIT_TRANSACTIONS` on, and an open transaction is reported only at the end as
   `DEPLOY INCOMPLETE`. The tool does not detect `ROWCOUNT`. I did not run either against a server.
-- **A server message that repeats a literal without single quotes is printed unmasked.** SQL Server does
-  not normally echo a literal that way. I made the test message up.
+- **A server message that repeats a literal without single quotes is printed unmasked.** I made the test
+  message up. `RAISERROR` and `THROW` print their message text as sent, so a string literal used as a
+  message reaches the batch error line unmasked.
+- **A literal after a `--` comment that ends in U+2028 is read as part of the comment.** The batch is not
+  marked as holding a literal, so a server echo of that literal is printed unmasked.
+- **A login or connection failure goes to stderr as the driver wrote it.** It can name the server, the
+  driver and the Windows account that failed to log in. The tool writes no log and the connection string
+  holds no password.
+- **The same-line `GO` check is slow on a line with `go`, then tens of thousands of spaces, then more
+  text.** 20,000 spaces took 2.1 s and 40,000 took 9.5 s on Windows (Python 3.13). The cause is the
+  adjacent `\s*;?\s*$` in the check's pattern.
+- **`SET NOCOUNT ON, NOEXEC ON` is not refused.** The check accepts only a comma list before the `ON`
+  word. I believe the server rejects this form as a syntax error, but I did not check the SET
+  statements page or a server.
 - **`--apply` sets no query timeout.** A batch that blocks, for example behind a lock, waits until you
   press Ctrl+C, which exits 2.
 - **The text `(comments only)` is only a label.** A batch is empty when it has no visible code. A batch

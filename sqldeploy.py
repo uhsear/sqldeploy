@@ -54,9 +54,11 @@ MASK = "***"
 # quoted: the batch holds a string or hex literal. tran: it holds BEGIN
 # TRANSACTION. apos: its string literals that contain an apostrophe, with
 # doubled quotes undoubled and white space squeezed, as a server may echo them.
+# dynamic: it runs text built from a string, EXEC('...') or sp_executesql, which
+# the tool cannot parse.
 Batch = collections.namedtuple(
     "Batch", "index first_line last_line text empty summary repeat quoted tran "
-             "apos")
+             "apos dynamic")
 
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 # GO as a word at the start of a line. GOTO, GO_1 and GO5 are not GO.
@@ -80,6 +82,11 @@ _MODE_RE = re.compile(
     r"SHOWPLAN_XML|IMPLICIT_TRANSACTIONS)\b", re.IGNORECASE)
 _TRAN_RE = re.compile(r"\bBEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?\b",
                       re.IGNORECASE)
+# EXEC or EXECUTE with a parenthesis or a string after it, or sp_executesql.
+# Run on text where each single-quoted literal is a bare quote pair, so
+# EXEC N'...' is seen and a word inside a literal is not.
+_DYNAMIC_RE = re.compile(
+    r"\bEXEC(?:UTE)?(?![\w@#$])\s*(?:\(|N?')|\bsp_executesql\b", re.IGNORECASE)
 _QUOTED_DETAIL_RE = re.compile(r"'(?:[^']|'')*'")
 # A hex literal of four bytes or more: a password hash, a SID or a key blob.
 _HEX_RE = re.compile(r"(?<![\w@#$])0[xX][0-9A-Fa-f]{8,}")
@@ -209,6 +216,19 @@ def _code_only(visible):
     return "".join(c if role == "code" else " " for c, _, role in _walk(visible))
 
 
+def _code_and_strings(visible):
+    """Code kept, single-quoted literals shortened to a quote pair, names blanked."""
+    out = []
+    for c, quote, role in _walk(visible):
+        if role == "code":
+            out.append(c)
+        elif quote == "'" and role == "delim":
+            out.append("'")
+        else:
+            out.append(" ")
+    return "".join(out)
+
+
 def _mask_literals(visible):
     """Replace string literal text and long hex literals with ***, so a secret is not echoed.
 
@@ -323,15 +343,20 @@ def split_script(text):
                     break
             index = len(batches) + 1
             code = _code_only(visible_text)
+            dynamic = bool(_DYNAMIC_RE.search(_code_and_strings(visible_text)))
             batches.append(Batch(index, first, last_line, body, empty,
                                  summary, repeat, masked != visible_text,
                                  bool(_TRAN_RE.search(code)),
-                                 _apostrophe_literals(visible_text)))
-            if _PARSEONLY_RE.search(code):
+                                 _apostrophe_literals(visible_text), dynamic))
+            # A dynamic batch can hold a setting inside its string, so the
+            # settings scan reads its literals too. A false refusal is the
+            # safe direction.
+            scan = visible_text if dynamic else code
+            if _PARSEONLY_RE.search(scan):
                 problems.append((first, "batch %d mentions PARSEONLY; the "
                                  "setting takes effect at parse time, so a "
                                  "script must not change it" % index))
-            mode = _MODE_RE.search(code)
+            mode = _MODE_RE.search(scan)
             if mode:
                 problems.append((first, "batch %d sets %s; that setting "
                                  "stops later batches from running while the "
@@ -419,9 +444,10 @@ def batch_label(batch):
 def format_split(batches):
     rows = []
     for b in batches:
-        rows.append("  %s: %d chars%s: %s" % (
+        rows.append("  %s: %d chars%s%s: %s" % (
             batch_label(b), len(b.text),
-            " x%d" % b.repeat if b.repeat > 1 else "", b.summary))
+            " x%d" % b.repeat if b.repeat > 1 else "",
+            " [dynamic SQL]" if b.dynamic else "", b.summary))
     return rows
 
 
@@ -430,8 +456,10 @@ def format_check(results):
     rows = []
     for b, status, detail in results:
         if status == "clean":
-            rows.append("  %s: parses clean, %d chars%s: %s" % (
-                batch_label(b), len(b.text),
+            rows.append("  %s: parses clean%s, %d chars%s: %s" % (
+                batch_label(b),
+                " (dynamic SQL text not parsed)" if b.dynamic else "",
+                len(b.text),
                 " x%d" % b.repeat if b.repeat > 1 else "", b.summary))
         elif status == "skipped":
             rows.append("  %s: skipped, nothing to run" % batch_label(b))
@@ -550,6 +578,11 @@ def _parser():
     ap.add_argument("--trust-server-certificate", action="store_true",
                     dest="trust_server_certificate",
                     help="skip server certificate validation (default off)")
+    ap.add_argument("--allow-dynamic", action="store_true",
+                    dest="allow_dynamic",
+                    help="accept batches that run EXEC('...') or "
+                         "sp_executesql text, which the parse check cannot "
+                         "read (default off)")
     ap.add_argument("--split-only", action="store_true", dest="split_only",
                     help="list the batches and exit; never connects")
     ap.add_argument("--apply", action="store_true",
@@ -624,6 +657,18 @@ def main(argv=None, connect=None):
         print("\n".join(format_split(batches)))
         print("\nSPLIT ONLY - no connection was made.")
         return EXIT_OK
+
+    dynamic = [b for b in runnable if b.dynamic]
+    if dynamic and not args.allow_dynamic:
+        for b in dynamic:
+            print("  %s: REFUSED: it runs text built from a string, EXEC "
+                  "with a parenthesis or a string, or sp_executesql. SET "
+                  "PARSEONLY does not read that text, so a typo in it "
+                  "would pass the check and fail during --apply, after "
+                  "earlier batches are committed" % batch_label(b))
+        print("\nnothing was sent to any server. Run again with "
+              "--allow-dynamic if you accept that risk.")
+        return EXIT_REFUSED
 
     connect = connect or _connect_pyodbc
     results, problem, _ = _with_connection(
@@ -1178,6 +1223,38 @@ def self_test():
     b, p = split_script("SELECT [a\r:r x]\nGO\n")
     check(not p, "a line inside a bracketed name that starts with a colon is not a directive")
 
+    # ---- text built from a string: SET PARSEONLY does not read it, so the
+    # batch is flagged, and a refused setting inside the string is refused
+    for text, label in (
+            ("EXEC('SELEC 1')\nGO\n", "EXEC with a parenthesis"),
+            ("exec ( N'SELEC 1' )\nGO\n", "lowercase exec with an N string"),
+            ("EXECUTE N'SELEC 1'\nGO\n", "EXECUTE with an N string"),
+            ("EXEC 'SELEC 1'\nGO\n", "EXEC with a string"),
+            ("EXEC(@sql)\nGO\n", "EXEC of a variable"),
+            ("EXEC sp_executesql N'SELEC 1'\nGO\n", "sp_executesql"),
+            ("EXEC sys.sp_executesql @s\nGO\n", "a schema-qualified sp_executesql"),
+            ("SELECT 1; EXEC('x')\nGO\n", "EXEC after another statement")):
+        b, p = split_script(text)
+        check(b[0].dynamic and not p,
+              "%s is flagged dynamic  <-- pinned defect" % label)
+    for text, label in (
+            ("SELECT 1\nGO\n", "a plain select"),
+            ("EXEC dbo.proc1 @a = 1\nGO\n", "a stored procedure call"),
+            ("EXECUTE AS USER = 'x'\nGO\n", "EXECUTE AS"),
+            ("PRINT 'EXEC(x) sp_executesql'\nGO\n", "EXEC inside a literal"),
+            ("SELECT [sp_executesql]\nGO\n", "a bracketed name"),
+            ("SELECT 1 -- EXEC('x')\nGO\n", "a comment"),
+            ("SELECT EXECUTED FROM t\nGO\n", "a word that starts with EXEC")):
+        check(not split_script(text)[0][0].dynamic,
+              "%s is not flagged dynamic" % label)
+    for text, word, label in (
+            ("EXEC('SET NOEXEC ON')\nGO\n", "NOEXEC", "NOEXEC inside EXEC"),
+            ("EXEC(N'SET NOCOUNT, FMTONLY ON')\nGO\n", "FMTONLY", "FMTONLY inside EXEC"),
+            ("EXEC sp_executesql N'SET PARSEONLY OFF'\nGO\n", "PARSEONLY",
+             "PARSEONLY inside sp_executesql")):
+        check(len(hits(text, word)) == 1,
+              "%s is REFUSED  <-- pinned defect" % label)
+
     # ---- several options in one SET: the SET statements page documents
     # "SET QUOTED_IDENTIFIER, ANSI_NULLS ON"
     for text, word, label in (
@@ -1526,6 +1603,32 @@ def self_test():
         code, out, err = run([broken] + server + ["--apply"], _fake_connect(log, conns))
         check(code == EXIT_REFUSED and not kinds(log, "exec"),
               "--apply with one unparseable batch runs NOTHING  <-- pinned defect")
+
+        dyn = write("dyn.sql", b"SELECT 1\nGO\nEXEC('SELEC 1')\nGO\n")
+        for extra, label in (([], "a check"), (["--apply"], "--apply")):
+            log, conns = [], []
+            code, out, err = run([dyn] + server + extra, _fake_connect(log, conns))
+            check(code == EXIT_REFUSED and not log and not conns
+                  and "batch 2 (lines 3-3): REFUSED" in out and "--allow-dynamic" in out,
+                  "%s of a script with EXEC text is REFUSED before any connection  <-- pinned defect"
+                  % label)
+        log, conns = [], []
+        code, out, err = run([dyn] + server + ["--allow-dynamic"], _fake_connect(log, conns))
+        check(code == EXIT_OK and "batch 2 (lines 3-3): parses clean (dynamic SQL text not parsed)" in out
+              and "batch 1 (lines 1-1): parses clean, " in out and "CHECK MODE" in out,
+              "--allow-dynamic checks, and the verdict says the EXEC text was not parsed  <-- pinned defect")
+        log, conns = [], []
+        code, out, err = run([dyn] + server + ["--allow-dynamic", "--apply"], _fake_connect(log, conns))
+        check(code == EXIT_OK and "DEPLOY OK - 2 batch(es)" in out and len(kinds(log, "exec")) == 2,
+              "--allow-dynamic with --apply runs the batches")
+        code, out, err = run([dyn, "--split-only"])
+        check(code == EXIT_OK and "batch 2 (lines 3-3): 16 chars [dynamic SQL]: EXEC('***')" in out
+              and "batch 1 (lines 1-1): 9 chars: SELECT 1" in out,
+              "--split-only lists the EXEC batch and marks it, and does not refuse")
+        noexec = write("dynnoexec.sql", b"EXEC('SET NOEXEC ON')\nGO\nSELECT 1\nGO\n")
+        code, out, err = run([noexec, "--split-only"])
+        check(code == EXIT_REFUSED and "sets NOEXEC" in out,
+              "SET NOEXEC inside an EXEC string is REFUSED, even with --split-only  <-- pinned defect")
 
         log, conns = [], []
         code, out, err = run([good] + server + ["--apply"], _fake_connect(log, conns))
