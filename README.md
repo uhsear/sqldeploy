@@ -67,6 +67,7 @@ PASS  each batch records its own line range
 PASS  a GO line inside a block comment is REFUSED  <-- pinned defect
 PASS  GO after a statement on the same line is REFUSED, not run as text  <-- pinned defect
 PASS  GO followed by a semicolon after code on the same line is REFUSED  <-- pinned defect
+PASS  GO after a multi-line single-quoted literal closes on its line is REFUSED  <-- pinned defect
 ...
 PASS  a prefix --app of --apply is REFUSED before any connection  <-- pinned defect
 ...
@@ -81,7 +82,7 @@ PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 ...
 --------------------------------------------------------------------
-274 assertions, 0 failed
+281 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -174,7 +175,7 @@ The rules, with the source of each:
 | `GO;` is refused. | The GO page: "Do not use a semicolon as a statement terminator after GO." |
 | The tool strips `GO` and sends each batch alone. | The GO page: "Applications based on the ODBC or OLE DB APIs receive a syntax error if they try to execute a GO command." |
 | Block comments nest. `/*` inside a comment opens a second level. | The block-comment page: "Nested comments are supported." |
-| A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that ends a line of code or follows a comment on its line, such as `SELECT 1 /* a */ GO` or `SELECT 1 GO;`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
+| A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that ends a line of code or follows a comment on its line, such as `SELECT 1 /* a */ GO` or `SELECT 1 GO;`. The same holds when the line starts inside a multi-line string, double-quoted name or bracketed name and the closing quote comes before the `GO`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
 | A script that sets or names `PARSEONLY` in code is refused. A mention inside a comment or a string is not. | The PARSEONLY page: "The setting of SET PARSEONLY is set at parse time and not at execute or run time." I could not test a real server. A script that sets it could change the mode the preview relies on. |
 | A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_ALL`, `SHOWPLAN_TEXT`, `SHOWPLAN_XML` or `IMPLICIT_TRANSACTIONS` is refused. | The NOEXEC page: SQL Server "parses and compiles each batch of Transact-SQL statements but does not execute them". The SHOWPLAN_ALL page: "Transact-SQL statements are not executed". The FMTONLY page: a rowset comes back "without any data rows". The IMPLICIT_TRANSACTIONS page: a statement starts a transaction that you must end with `COMMIT` or `ROLLBACK`. After any of these a deploy could print `DEPLOY OK` and have changed nothing. |
 | A script that holds `BEGIN TRANSACTION` is accepted. A failure message then carries a note. | The BEGIN TRANSACTION page: an explicit transaction ends only with `COMMIT` or `ROLLBACK`. Under `autocommit` a batch inside one is not committed on its own, so the "already committed" count may be too high. The note names the batches. |
@@ -357,9 +358,9 @@ That run was made before the lexer work (lone CR, bracketed and double-quoted na
 open-transaction check, so it does not cover them. For those I made five single edits by hand and ran the
 self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), no `]]` escape (2 failed),
 `--` no longer starting a comment (23 failed), `[` no longer opening a name (14 failed), and the
-open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (2 failed).
+open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (2 failed). A seventh edit stopped the same-line `GO` check from walking a line that starts inside a quote (6 assertions failed).
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1083 statements, 264
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1091 statements, 266
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -450,7 +451,7 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   run and are committed, and exits 2. Nothing ran in that case.
 - **A batch with hundreds of thousands of blank or comment-only lines splits very slowly.** The time
   grows with the square of the line count. 20,000 comment lines split in 0.7 s on Windows and 200,000
-  took about a minute. The cause is the `^\s*:[A-Za-z]` directive scan over the comment-blanked text.
+  took about a minute. 50,000 indented lines inside one block comment took 32.8 s. The cause is the `^\s*:[A-Za-z]` directive scan over the comment-blanked text.
 - **A `--` comment ends only at CR or LF.** The tool follows the comment page. Unicode line separators
   (U+2028, U+2029, U+0085), vertical tab and form feed do not end it here. SQL Server, `sqlcmd` or SSMS
   may treat them differently. I did not test that. If one does, a `SET NOEXEC ON` after such a character
@@ -481,6 +482,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A driver error is read as `(sqlstate, message)`.** When the exception has two arguments and the second
   is text, the tool masks and prints that message. Any other exception prints as `str()` of it. I tested
   the two-argument shape with a hand-built exception, never with a real SQL Server message.
+- **A malformed `GO` line does not carry its quote state forward.** A line such as `GO"""` is read as a `GO` line, so its quotes are not tracked. The script is refused for the malformed `GO` anyway, but line numbers in later refusal text can be off.
+- **`SET [PARSEONLY] OFF` is not seen.** Bracketed text is blanked before the `PARSEONLY` scan. I believe the SET statements page does not allow a bracketed option name, so the server would reject it. I had no server to confirm this.
 - **A script with one multi-megabyte string literal splits slowly.** A literal of 400,000 characters
   took about 3 seconds on Windows. Time grows faster than the length.
 - **`SET ANSI_DEFAULTS ON` and `SET ROWCOUNT n` are not refused.** The SET ANSI_DEFAULTS page says the

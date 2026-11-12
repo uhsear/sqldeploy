@@ -377,7 +377,9 @@ def split_script(text):
         in_quote = quote
         visible, depth, quote = _scan_line(body, depth, quote)
         vis.append(visible)
-        if not in_quote and _GO_AFTER_RE.search(_code_only(visible)):
+        # A line that starts inside a literal or name is walked from that
+        # open quote, so a closing quote before GO still counts as code.
+        if _GO_AFTER_RE.search(_code_only((in_quote or "") + visible)):
             problems.append((number, "GO follows code or a comment on the "
                              "same line; the Microsoft GO page says GO must "
                              "be alone on its line, so the tool cannot tell "
@@ -952,6 +954,18 @@ def self_test():
           "GO after a leading comment is REFUSED  <-- pinned defect")
     b, p = split_script("SELECT 1 /* a\nb */ GO\nGO\n")
     check(len(p) == 1 and p[0][0] == 2, "GO after the end of a multi-line comment is REFUSED")
+    for label, opener, closer in (("single-quoted literal", "'", "'"),
+                                  ("double-quoted name", '"', '"'),
+                                  ("bracketed name", "[", "]")):
+        script = "SELECT %sa\nb%s GO\nSELECT 2\nGO\n" % (opener, closer)
+        b, p = split_script(script)
+        check(len(p) == 1 and p[0][0] == 2 and "GO follows code" in p[0][1],
+              "GO after a multi-line %s closes on its line is REFUSED  <-- pinned defect" % label)
+        b, p = split_script(script.replace("\n", "\r\n"))
+        check(len(p) == 1 and p[0][0] == 2,
+              "the same GO after a multi-line %s is REFUSED with CRLF line ends  <-- pinned defect" % label)
+    b, p = split_script("SELECT 'a\nb' AS x\nGO\n")
+    check(not p and len(b) == 1, "a literal that closes on its own line with no GO after it is clean")
     b, p = split_script("SELECT * FROM dbo.go\nGO\nSELECT 1 AS [go], 'x GO'\nGO\nSELECT 'a\n b GO'\nGO\n")
     check(not p and len(b) == 3,
           "go as a dotted name, a bracketed name or inside a literal is not GO")
