@@ -223,6 +223,9 @@ Pages cited:
 - <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/comment-transact-sql> (`--` comments end at a carriage return, a line feed, or both.)
 - <https://learn.microsoft.com/en-us/sql/relational-databases/databases/database-identifiers> (`]]` and `""` escapes; double-quote delimiters need `QUOTED_IDENTIFIER ON`.)
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-statements-transact-sql> ("SET QUOTED_IDENTIFIER, ANSI_NULLS ON sets both"; one `SET` can name several options.)
+  The same page lists the statistics statements as `SET STATISTICS IO`, `XML`, `PROFILE` and `TIME`, and says the multi-option form "doesn't apply to the statistics related SET options".
+- <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-statistics-time-transact-sql> ("The setting of SET STATISTICS TIME is set at execute or run time and not at parse time.")
+- <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-ansi-defaults-transact-sql> (When ON, it enables the ISO settings, `SET IMPLICIT_TRANSACTIONS` among them.)
 - <https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-1505-database-engine-error> (The server prints the duplicate key value in its message: "The duplicate key value is %ls." The tool masks that value in every batch. The parenthesised form `(value)` of Msg 2601 and 2627 is what I expect from those messages. I did not see it on a real server, and no Microsoft page I found quotes it.)
 - <https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility>
 - <https://learn.microsoft.com/en-us/ssms/f1-help/database-engine-query-editor-sql-server-management-studio>
@@ -539,7 +542,11 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   `EXEC @proc`, is not flagged.
   A stored procedure call such as `EXEC dbo.proc1` is not flagged either, and the procedure body is not
   read. I did not check whether a `SET` inside the string stays in effect after the `EXEC` returns.
-- **`SET STATISTICS PARSE` is not in the refused list.** I did not check its semantics.
+- **`SET STATISTICS PARSE` is not in the refused list, and is not a SET option.** The SET statements page lists
+  only `SET STATISTICS IO`, `XML`, `PROFILE` and `TIME`. A script that sets `PARSE` should fail as a syntax
+  error, so the preview should report `PARSE ERROR` for it. I had no server to confirm that. The SET
+  STATISTICS TIME page says it "is set at execute or run time and not at parse time" and the options print
+  timings, so none of the four stops later batches.
 - **Python treats VT, FF, FS, GS, RS, US, NEL and NBSP as whitespace.** A batch that holds only those
   characters counts as empty and is dropped from the batch count, not listed as skipped.
 - **A line that starts with the word `go` inside an open comment or string is refused.** Prose such as
@@ -570,9 +577,21 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **The same-line `GO` check is slow on a line with `go`, then tens of thousands of spaces, then more
   text.** 20,000 spaces took 2.1 s and 40,000 took 9.5 s on Windows (Python 3.13). The cause is the
   adjacent `\s*;?\s*$` in the check's pattern.
-- **`SET NOCOUNT ON, NOEXEC ON` is not refused.** The check accepts only a comma list before the `ON`
-  word. I believe the server rejects this form as a syntax error, but I did not check the SET
-  statements page or a server.
+- **`SET NOCOUNT ON, NOEXEC ON` is not refused.** The check scans the option names that come before
+  the `ON` word, which is the form the SET statements page shows: "SET QUOTED_IDENTIFIER, ANSI_NULLS ON".
+  That page does not show an `ON` before a comma, so the tool does not scan after the `ON` word. I believe the
+  server rejects that form as a syntax error, but I had no server to confirm it.
+- **An empty script is a refusal, not a clean run.** A file with no statements, or only comments, prints
+  `Nothing to do` and exits 1. I ran it.
+- **A closed stdout ends with the interpreter's own exit code.** With output piped to `head -c 0` on Windows, the
+  run printed `Exception ignored on flushing sys.stdout` and exited 120 in Git Bash, not one of the tool's
+  documented codes. Read the output to the end.
+- **Other ways to run a string as SQL are not flagged as dynamic.** `sp_prepexec`, `sp_prepare` with
+  `sp_execute`, `sp_cursoropen`, `EXEC ... AT` a linked server and `OPENQUERY` take text, and the tool does
+  not read it. A `SET NOEXEC ON` hidden in such a string is not seen. Only `EXEC` with a parenthesis or a
+  string, and `sp_executesql`, trigger the `--allow-dynamic` refusal.
+- **A leading ODBC brace escape such as `{call ...}` is not checked.** The driver may translate it before
+  the server sees the batch. I did not test this.
 - **`--apply` sets no query timeout.** A batch that blocks, for example behind a lock, waits until you
   press Ctrl+C, which exits 2.
 - **The text `(comments only)` is only a label.** A batch is empty when it has no visible code. A batch
