@@ -77,7 +77,7 @@ PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 ...
 --------------------------------------------------------------------
-260 assertions, 0 failed
+264 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -133,7 +133,8 @@ The tool's own code reads no environment variable, so none can switch on `--appl
 reads some: `argparse` reads `COLUMNS` to wrap `--help`, and `pyodbc` and the ODBC driver read their
 own settings. The tool uses Windows authentication only (`Trusted_Connection=yes`). It has no password
 option and never reads or stores a password. It prints no string literal from your script in a batch
-summary or a batch error. A literal is shown as `'***'`, and so is quoted text in a server error. A bad
+summary or a batch error. This is a best effort, not a guarantee: Limits lists what it does not
+catch. A literal is shown as `'***'`, and so is quoted text in a server error. A bad
 flag is named in the error, but its value is not echoed, because it could be a password.
 
 ## How the split works
@@ -178,6 +179,7 @@ The rules, with the source of each:
 | `[ ... ]` and `" ... "` open a name that can hold `--`, `/*`, `'` and a `GO`-looking line. A `]]` inside brackets and a `""` inside double quotes are escapes. A left bracket needs no escape. | The identifiers page: "If the identifier itself contains a right bracket ( ] ), escape it by doubling it ( ]] ). A left bracket ( [ ) doesn't require escaping." and "If the identifier itself contains a double quotation mark, escape it by doubling it ( "" )." |
 | A stacked statement after a bracketed name or after a lone-CR comment is scanned like any other code: `SET NOEXEC ON` is refused and `BEGIN TRAN` is seen. A comma list such as `SET NOCOUNT, NOEXEC ON` is scanned too. | The SET statements page says one `SET` can name several options, so a refused option can follow a comma. |
 | A line that starts with `:` and a letter (a sqlcmd directive) is refused. | Directives such as `:setvar` belong to sqlcmd. This tool does not run sqlcmd scripts. |
+| A sqlcmd variable reference `$(Name)` outside a comment, inside a string or a bracketed name too, is refused. | The sqlcmd page describes the `-x` option as one that makes sqlcmd "ignore scripting variables" for scripts with strings that "have the same format as regular variables, such as `$(<variable_name>)`". So sqlcmd expands the reference inside a string. This tool does not expand it, and `CREATE DATABASE [$(Name)]` is valid Transact-SQL that would create a database with that literal name. |
 | A script with a NUL character is refused with exit 64. | UTF-16 without a BOM, and UTF-32, decode to text full of NULs. The driver may read the SQL as null-terminated text and stop at the first one. I did not test that. |
 | Line endings inside a batch are sent unchanged. | A CRLF inside a multi-line string literal is part of the data. |
 
@@ -199,7 +201,7 @@ Pages cited:
 - <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/comment-transact-sql> (`--` comments end at a carriage return, a line feed, or both.)
 - <https://learn.microsoft.com/en-us/sql/relational-databases/databases/database-identifiers> (`]]` and `""` escapes; double-quote delimiters need `QUOTED_IDENTIFIER ON`.)
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-statements-transact-sql> ("SET QUOTED_IDENTIFIER, ANSI_NULLS ON sets both"; one `SET` can name several options.)
-- <https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-1505-database-engine-error> (The server prints the duplicate key value in its message: "The duplicate key value is %ls." The tool masks that value when the batch holds a literal. The parenthesised form `(value)` of Msg 2601 and 2627 is what I expect from those messages. I did not see it on a real server, and no Microsoft page I found quotes it.)
+- <https://learn.microsoft.com/en-us/sql/relational-databases/errors-events/mssqlserver-1505-database-engine-error> (The server prints the duplicate key value in its message: "The duplicate key value is %ls." The tool masks that value in every batch. The parenthesised form `(value)` of Msg 2601 and 2627 is what I expect from those messages. I did not see it on a real server, and no Microsoft page I found quotes it.)
 - <https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility>
 - <https://learn.microsoft.com/en-us/ssms/f1-help/database-engine-query-editor-sql-server-management-studio>
 - <https://learn.microsoft.com/en-us/sql/connect/odbc/dsn-connection-string-attribute> (`Encrypt` defaults to `yes` from driver 18 and to `no` before. The tool writes `Encrypt=yes` out.)
@@ -271,6 +273,26 @@ nothing was sent to any server.
 The same refusal fires when the `SET NOEXEC ON` follows a `--` comment that ends in a lone carriage
 return (`-- note<CR>SET NOEXEC ON<CR>GO<CR>`), because that comment ends at the CR.
 
+A sqlcmd variable is refused, because this tool would send `$(DbName)` to the server as text.
+The sample `var.sql`:
+
+```
+CREATE DATABASE [$(DbName)]
+GO
+INSERT dbo.cfg (env) VALUES ('$(Env)')
+GO
+```
+
+```
+$ python sqldeploy.py var.sql --server h --database d --apply
+var.sql: 2 batch(es), 2 with statements
+  line 1: REFUSED: batch 1 has a sqlcmd variable reference such as $(Name); this tool does not expand variables, so the server would get the text as written
+  line 3: REFUSED: batch 2 has a sqlcmd variable reference such as $(Name); this tool does not expand variables, so the server would get the text as written
+
+nothing was sent to any server.
+(exit 1)
+```
+
 A `GO` that hides inside a comment:
 
 ```
@@ -311,7 +333,8 @@ nothing was sent to any server.
 | UTF-16 and UTF-8 BOM scripts | `--self-test`, at the decode level and end to end through `main()` |
 | A lone CR ends a `--` comment; bracketed and double-quoted names hide `--`, `/*`, `'` and `GO`; a stacked `SET NOEXEC ON` or `BEGIN TRAN` after them is seen | `--self-test`: the lexer section, the cases marked `pinned defect` among them |
 | An open transaction at the end is not reported OK | `--self-test`: a fake cursor counts `BEGIN TRAN` and `COMMIT`; an uncommitted script exits 2, a committed one exits 0, and a failing count query exits 2 |
-| A duplicate key value in parentheses is masked | `--self-test`: a fake server message in the Msg 2627 shape |
+| A duplicate key value in parentheses is masked, with or without a literal in the batch | `--self-test`: a fake server message in the Msg 2627 shape, for a batch with a literal and for an `INSERT ... SELECT` with none |
+| A `$(Name)` reference is refused | `--self-test`: one in a bracketed name, one in a string, and three texts that are not references. The `var.sql` run above is real. |
 
 The self-test writes small files in directories named `sqldeploy-test-*` under the system temp
 directory, and removes them. Nothing else in the tool writes a file. Only `--apply` writes to a server.
@@ -332,7 +355,7 @@ self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), 
 `--` no longer starting a comment (21 failed), `[` no longer opening a name (13 failed), and the
 open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (1 failed).
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1039 statements, 258
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1052 statements, 260
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -351,8 +374,9 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   not promise that an unknown table or a permission problem shows up before `--apply`. The PARSEONLY
   page does not mention dynamic SQL, and I did not test it. Assume text inside `EXEC` or
   `sp_executesql` strings is not checked.
-- **A driver error during the preview is reported as a parse error.** A lost connection or a timeout
-  shows as `PARSE ERROR` for that batch and exit 1, not as exit 3. The tool sets no connect or query
+- **A driver error during the preview is reported as a parse error.** A non-syntax driver error that
+  leaves the connection alive, such as a query timeout, shows as `PARSE ERROR` for that batch and exit
+  1. Only a lost connection exits 3, because the closing `SET PARSEONLY OFF` fails too. The tool sets no connect or query
   timeout, so a hung server can block a run.
 - **`--apply` has no rollback.** It connects with `autocommit=True`, so each batch commits on its own.
   The parse gate cuts the chance of a half-deployed script. It does not remove it. A batch can still
@@ -383,14 +407,15 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   a batch of only Unicode whitespace counts as empty. `sqlcmd` may read them differently. Non-ASCII
   digits after `GO` are refused as malformed.
 - **sqlcmd features are not run.** `:r`, `:setvar` and `$(var)` are not expanded. A line that starts
-  with a directive is refused. A `$(var)` in a batch is sent as text and the server decides. Under
-  `--apply`, `CREATE DATABASE [$(Name)]` would create a database named `$(Name)`.
+  with a directive is refused, and so is a `$(Name)` reference outside a comment. The check reads the
+  characters `$(`, a letter or underscore, letters, digits or underscores, and `)`. It also refuses a
+  string that only looks like a variable, such as `'$(Env)'`. That is the safe direction.
 - **A question mark may confuse the driver.** I did not test whether the ODBC driver reads a `?` in a
   script, even inside a comment, as a parameter marker. If it does, a legitimate script gets a false
   `PARSE ERROR`. That is the safe direction.
 - **Masking is a best effort.** A string literal, and a hex literal of four bytes or more, is masked in
   batch summaries. Quoted text in a server message is masked when the batch holds a literal, and so is
-  the value in `The duplicate key value is (...)`. A literal that holds an apostrophe is also masked
+  the value in `The duplicate key value is (...)`, which is masked in every batch. A literal that holds an apostrophe is also masked
   when the server prints it with the apostrophe undoubled, with or without a space at either end of
   the literal. I did not test any of this against real
   server messages. Bracketed names are shown. A secret in a comment is blanked, not printed.
@@ -399,8 +424,12 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   secret in a flag name.
 - **Only quoted text and long hex are masked.** A hex literal shorter than four bytes is shown. A hex
   literal in a server message is masked only when the batch holds a literal. A server message that
-  repeats a value from table data, such as the duplicate key value of an `INSERT ... SELECT`, is
-  printed as the server sent it, because the tool cannot know that the value is secret.
+  repeats any other value from table data, such as a conversion failure on a column value of an
+  `INSERT ... SELECT`, is printed as the server sent it, because the tool cannot know that the value
+  is secret.
+- **Server error text is masked by pairing single quotes.** A literal that the server repeats after an
+  apostrophe in its own wording, without a closing quote, or in double quotes is printed as sent. I
+  tested this only with made-up server messages.
 - **Curly quotes are not string delimiters here.** Text between U+2018 and U+2019 is read as code, so a
   literal inside them is not masked. I did not check how SQL Server reads those characters.
 - **A column named after a refused `SET` option is refused as a false positive.** `UPDATE t SET noexec = 1`
@@ -415,6 +444,9 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A failure before the first batch uses the same message as a failure during a batch.** If the
   cursor cannot be created after the connect, the tool still prints that some batches may already have
   run and are committed, and exits 2. Nothing ran in that case.
+- **A batch with hundreds of thousands of blank or comment-only lines splits very slowly.** The time
+  grows with the square of the line count. 20,000 comment lines split in 0.7 s on Windows and 200,000
+  took about a minute. The cause is the `^\s*:[A-Za-z]` directive scan over the comment-blanked text.
 - **A `--` comment ends only at CR or LF.** The tool follows the comment page. Unicode line separators
   (U+2028, U+2029, U+0085), vertical tab and form feed do not end it here. SQL Server, `sqlcmd` or SSMS
   may treat them differently. I did not test that. If one does, a `SET NOEXEC ON` after such a character
@@ -433,7 +465,7 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   stays in effect after the `EXEC` returns.
 - **`SET STATISTICS PARSE` is not in the refused list.** I did not check its semantics.
 - **Python treats VT, FF, FS, GS, RS, US, NEL and NBSP as whitespace.** A batch that holds only those
-  characters counts as empty and is skipped.
+  characters counts as empty and is dropped from the batch count, not listed as skipped.
 - **A line that starts with the word `go` inside an open comment or string is refused.** Prose such as
   `go live Monday` on its own line in a block comment or a multi-line literal is read as a `GO` line.
   This is a safe false refusal and exits 1. I ran it.

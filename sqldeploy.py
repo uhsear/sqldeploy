@@ -81,6 +81,10 @@ _HEX_RE = re.compile(r"(?<![\w@#$])0[xX][0-9A-Fa-f]{8,}")
 _KEY_DETAIL_RE = re.compile(r"(duplicate key value is )\(.*\)\.", re.IGNORECASE)
 _FLAG_NAME_RE = re.compile(r"--[A-Za-z][A-Za-z0-9-]{0,39}\Z")
 _DIRECTIVE_RE = re.compile(r"^\s*:[A-Za-z]", re.MULTILINE)
+# A sqlcmd scripting variable, $(Name). The sqlcmd page says the -x option
+# exists for strings in INSERT statements "that have the same format as regular
+# variables", so sqlcmd expands them inside strings too.
+_VARIABLE_RE = re.compile(r"\$\([A-Za-z_][A-Za-z0-9_]*\)")
 _UNSAFE_CHARS_RE = re.compile(r"[^\x20-\x7e]")
 _BAD_CONN_VALUE_RE = re.compile(r"[;{}\x00-\x1f]")
 
@@ -262,6 +266,7 @@ def server_detail(exc, batch):
     The server often repeats the token it stopped at, which can be a literal.
     """
     text = " ".join(str(exc).split())
+    text = _KEY_DETAIL_RE.sub(r"\1(%s)." % MASK, text)
     if batch.quoted:
         for literal in batch.apos:
             # The server keeps the padding of a literal, which the squeeze above
@@ -269,7 +274,6 @@ def server_detail(exc, batch):
             text = re.sub("' ?%s ?'" % re.escape(literal), "'%s'" % MASK, text)
         text = _QUOTED_DETAIL_RE.sub("'%s'" % MASK, text)
         text = _HEX_RE.sub(MASK, text)
-        text = _KEY_DETAIL_RE.sub(r"\1(%s)." % MASK, text)
     return one_line(text, DETAIL_WIDTH)
 
 
@@ -322,6 +326,11 @@ def split_script(text):
                 problems.append((first, "batch %d has a sqlcmd directive "
                                  "(a line starting with a colon); this tool "
                                  "does not run sqlcmd scripts" % index))
+            if _VARIABLE_RE.search(visible_text):
+                problems.append((first, "batch %d has a sqlcmd variable "
+                                 "reference such as $(Name); this tool does "
+                                 "not expand variables, so the server would "
+                                 "get the text as written" % index))
         state["start"] = last_line + 2
 
     lines = _LINE_RE.findall(text)
@@ -1033,6 +1042,14 @@ def self_test():
     check(not p, "a line inside a string that starts with a colon is not a directive")
     b, p = split_script("SELECT 1\n::fn_x()\nGO\n")
     check(not p, "a :: function call is not a sqlcmd directive")
+    b, p = split_script("CREATE DATABASE [$(DbName)]\nGO\n")
+    check(len(p) == 1 and "variable" in p[0][1] and "batch 1" in p[0][1],
+          "a sqlcmd variable in a bracketed name is REFUSED  <-- pinned defect")
+    b, p = split_script("INSERT dbo.cfg (env) VALUES ('$(Env)')\nGO\n")
+    check(len(p) == 1 and "variable" in p[0][1],
+          "a sqlcmd variable in a string is REFUSED  <-- pinned defect")
+    b, p = split_script("SELECT 1 -- $(Env)\nSELECT $5, '$(', '$x(y)', '$()'\nGO\n")
+    check(not p, "a variable in a comment, and text that is not $(Name), is not refused")
 
     # ---- a stacked statement after a line comment ended by a lone CR, and
     # around bracket- and quote-delimited names. The -- page says a comment
@@ -1331,6 +1348,7 @@ def self_test():
         open_tran = write("open_tran.sql", b"BEGIN TRANSACTION\nGO\nCREATE TABLE a (x int)\nGO\n")
         shut_tran = write("shut_tran.sql", b"BEGIN TRANSACTION\nGO\nCREATE TABLE a (x int)\nGO\nCOMMIT\nGO\n")
         dupkey = write("dupkey.sql", b"INSERT dbo.cfg (k) VALUES ('Sup3rS3cret!x') -- DUPKEY\nGO\n")
+        dupkey_nolit = write("dupkey_nolit.sql", b"INSERT dbo.cfg (k) SELECT k FROM dbo.staging -- DUPKEY\nGO\n")
         ctrlc = write("ctrlc.sql", b"SELECT 1\nGO\nCTRLC\nGO\nSELECT 3\nGO\n")
         accent = write("caf\u00e9.sql", b"SELECT 1\nGO\n")
 
@@ -1499,6 +1517,11 @@ def self_test():
         check(code == EXIT_APPLY_FAILED and "Sup3rS3cret" not in out
               and "The duplicate key value is (***). (2627)" in out,
               "a duplicate key value the server prints in parentheses is masked  <-- pinned defect")
+        log, conns = [], []
+        code, out, err = run([dupkey_nolit] + server + ["--apply"], _fake_connect(log, conns))
+        check(code == EXIT_APPLY_FAILED and "Sup3rS3cret" not in out
+              and "The duplicate key value is (***). (2627)" in out,
+              "a duplicate key value is masked when the batch has no literal  <-- pinned defect")
 
         log, conns = [], []
         code, out, err = run([ctrlc] + server + ["--apply"], _fake_connect(log, conns))
