@@ -61,6 +61,11 @@ Batch = collections.namedtuple(
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 # GO as a word at the start of a line. GOTO, GO_1 and GO5 are not GO.
 _GO_RE = re.compile(r"^\s*GO(?![\w@#$])(.*)$", re.IGNORECASE)
+# GO as the last word of a line that holds other code or a leading comment.
+# Run on comment-free, literal-free text. Dots and brackets before GO mean a
+# name (dbo.go), so they do not match.
+_GO_AFTER_RE = re.compile(r"(?<![\w@#$.\]])GO(?![\w@#$])(?:\s+[0-9]+)?\s*$",
+                          re.IGNORECASE)
 _GO_TAIL_RE = re.compile(r"^(?:\s+([0-9]+))?\s*(?:--.*)?$")
 _PARSEONLY_RE = re.compile(r"\bPARSEONLY\b", re.IGNORECASE)
 # Settings that stop later batches from running while the server still says OK.
@@ -265,7 +270,15 @@ def server_detail(exc, batch):
 
     The server often repeats the token it stopped at, which can be a literal.
     """
-    text = " ".join(str(exc).split())
+    args = getattr(exc, "args", ())
+    # pyodbc raises Error(sqlstate, message). str() of that is a tuple repr,
+    # which doubles backslashes and escapes apostrophes, so the literal masks
+    # below would not match. Use the message text itself.
+    if len(args) == 2 and isinstance(args[1], str):
+        raw = args[1]
+    else:
+        raw = str(exc)
+    text = " ".join(raw.split())
     text = _KEY_DETAIL_RE.sub(r"\1(%s)." % MASK, text)
     if batch.quoted:
         for literal in batch.apos:
@@ -300,12 +313,13 @@ def split_script(text):
         if body.strip():
             masked = _mask_literals(visible_text)
             summary = COMMENTS_ONLY
+            empty = True
             for one in masked.split("\n"):
                 squeezed = one_line(one, SUMMARY_WIDTH)
                 if squeezed:
                     summary = squeezed
+                    empty = False
                     break
-            empty = summary == COMMENTS_ONLY
             index = len(batches) + 1
             code = _code_only(visible_text)
             batches.append(Batch(index, first, last_line, body, empty,
@@ -359,8 +373,14 @@ def split_script(text):
             flush(number - 1, repeat)
             continue
         raw.append(line)
+        in_quote = quote
         visible, depth, quote = _scan_line(body, depth, quote)
         vis.append(visible)
+        if not in_quote and _GO_AFTER_RE.search(_code_only(visible)):
+            problems.append((number, "GO follows code or a comment on the "
+                             "same line; the Microsoft GO page says GO must "
+                             "be alone on its line, so the tool cannot tell "
+                             "where the batch ends"))
     if depth or quote:
         problems.append((len(lines), "the script ends inside an unclosed "
                          "comment, string or bracketed name"))
@@ -915,7 +935,19 @@ def self_test():
     b, p = split_script("SELECT 1 AS GO_1\nGO5\n")
     check(len(b) == 1 and not p, "GO_1 and GO5 are not GO")
     b, p = split_script("SELECT 1 GO\nSELECT 2\n")
-    check(len(b) == 1 and not p, "GO after a statement on the same line is not a separator")
+    check(len(b) == 1 and len(p) == 1 and p[0][0] == 1 and "GO follows code" in p[0][1],
+          "GO after a statement on the same line is REFUSED, not run as text  <-- pinned defect")
+    b, p = split_script("SELECT 1 /* c */ GO\nDROP TABLE dbo.victim\nGO\n")
+    check(len(p) == 1 and p[0][0] == 1,
+          "GO after a block comment on a code line is REFUSED  <-- pinned defect")
+    b, p = split_script("SELECT 1\n/* c */ GO\nDROP TABLE dbo.victim\nGO\n")
+    check(len(p) == 1 and p[0][0] == 2,
+          "GO after a leading comment is REFUSED  <-- pinned defect")
+    b, p = split_script("SELECT 1 /* a\nb */ GO\nGO\n")
+    check(len(p) == 1 and p[0][0] == 2, "GO after the end of a multi-line comment is REFUSED")
+    b, p = split_script("SELECT * FROM dbo.go\nGO\nSELECT 1 AS [go], 'x GO'\nGO\nSELECT 'a\n b GO'\nGO\n")
+    check(not p and len(b) == 3,
+          "go as a dotted name, a bracketed name or inside a literal is not GO")
     b, p = split_script("SELECT 1\r\nGO\r\nSELECT 2\r\n")
     check([x.text for x in b] == ["SELECT 1\r\n", "SELECT 2\r\n"],
           "CRLF line endings split and are kept in the batch text")
@@ -1152,6 +1184,9 @@ def self_test():
     b, p = split_script("-- only a note\nGO\nSELECT 1\nGO\n")
     check(b[0].empty and b[0].summary == COMMENTS_ONLY and not b[1].empty,
           "a comment-only batch is marked empty")
+    b, p = split_script(COMMENTS_ONLY + "\nCREATE TABLE dbo.keep (x int)\nGO\n")
+    check(not b[0].empty,
+          "a batch whose first line reads like the empty marker is still run  <-- pinned defect")
     b, p = split_script("SELECT " + "x" * 200 + "\nGO\n")
     check(len(b[0].summary) == SUMMARY_WIDTH, "a long first statement is cut to the summary width")
     b, p = split_script("SELECT [caf\u00e9\x1b[31m]\nGO\n")
@@ -1195,6 +1230,18 @@ def self_test():
                                    "'pa'ss1' to data type int."), b[0])
     check("ss1" not in out and "pa" not in out and "'***'" in out,
           "a literal echoed with its apostrophe undoubled is masked whole  <-- pinned defect")
+    bs = chr(92)
+    b, p = split_script("ALTER LOGIN a WITH PASSWORD = 'it''s" + bs + "Q9' BAD\nGO\n")
+    out = server_detail(_FakeError("42000", "[42000] Incorrect syntax near 'it's" + bs + "Q9'. (102)"), b[0])
+    check("Q9" not in out and "'***'" in out,
+          "a driver error (sqlstate, message) is masked from the message, not its tuple repr  <-- pinned defect")
+    out = server_detail(_FakeError("42000", "Incorrect syntax near 'it's'. Cannot open \"db\""),
+                        split_script("SELECT 'it''s'\nGO\n")[0][0])
+    check("it" not in out.replace("Incorrect", "").replace("syntax", "").replace("Cannot", "")
+          and "'***'" in out,
+          "an apostrophe literal beside a double quote in a driver message is masked  <-- pinned defect")
+    out = server_detail(_FakeError(1, 2), b[0])
+    check(out == "(1, 2)", "an error whose second argument is not text falls back to str()")
     out = server_detail(_FakeError("Incorrect syntax near 0x0200A1B2C3D4E5F6."), b[0])
     check("0x0200" not in out and MASK in out, "a hex token in a server message is masked")
     b, p = split_script("CREATE CERTIFICATE c FROM BINARY = 0x3082010A0282010100\nGO\n")
