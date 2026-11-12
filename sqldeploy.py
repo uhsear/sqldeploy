@@ -82,15 +82,18 @@ _MODE_RE = re.compile(
     r"SHOWPLAN_XML|IMPLICIT_TRANSACTIONS)\b", re.IGNORECASE)
 _TRAN_RE = re.compile(r"\bBEGIN\s+(?:DISTRIBUTED\s+)?TRAN(?:SACTION)?\b",
                       re.IGNORECASE)
-# EXEC or EXECUTE with a parenthesis or a string after it, or sp_executesql.
-# Run on text where each single-quoted literal is a bare quote pair, so
-# EXEC N'...' is seen and a word inside a literal is not.
+# EXEC or EXECUTE with a parenthesis or a string after it, or sp_executesql,
+# bare, in brackets or in double quotes. Run on text where each single-quoted
+# literal is a bare quote pair and names keep their delimiters, so EXEC N'...'
+# and [sys].[sp_executesql] are seen and a word inside a literal is not.
 _DYNAMIC_RE = re.compile(
-    r"\bEXEC(?:UTE)?(?![\w@#$])\s*(?:\(|N?')|\bsp_executesql\b", re.IGNORECASE)
+    r"\bEXEC(?:UTE)?(?![\w@#$])\s*(?:\(|N?')|\bsp_executesql\b"
+    r"|[\[\"]\s*sp_executesql\s*[\]\"]", re.IGNORECASE)
 _QUOTED_DETAIL_RE = re.compile(r"'(?:[^']|'')*'")
 # A hex literal of four bytes or more: a password hash, a SID or a key blob.
 _HEX_RE = re.compile(r"(?<![\w@#$])0[xX][0-9A-Fa-f]{8,}")
-# Msg 2601 and 2627 print the key value in parentheses, not in quotes.
+# Msg 2601 and 2627 are expected to print the key value in parentheses, not
+# in quotes. Not seen on a real server.
 _KEY_DETAIL_RE = re.compile(r"(duplicate key value is )\(.*\)\.", re.IGNORECASE)
 _FLAG_NAME_RE = re.compile(r"--[A-Za-z][A-Za-z0-9-]{0,39}\Z")
 _DIRECTIVE_RE = re.compile(r"^\s*:[A-Za-z]", re.MULTILINE)
@@ -217,10 +220,10 @@ def _code_only(visible):
 
 
 def _code_and_strings(visible):
-    """Code kept, single-quoted literals shortened to a quote pair, names blanked."""
+    """Code and names kept, single-quoted literals shortened to a quote pair."""
     out = []
     for c, quote, role in _walk(visible):
-        if role == "code":
+        if role == "code" or quote in ('"', "["):
             out.append(c)
         elif quote == "'" and role == "delim":
             out.append("'")
@@ -564,10 +567,12 @@ def _parser():
     ap = _Parser(
         prog="sqldeploy.py",
         allow_abbrev=False,
+        add_help=False,
         description="Preview a T-SQL deploy script one GO batch at a time, "
                     "then run it only on --apply.",
         epilog="Nothing is written without --apply. Unknown arguments and "
-               "abbreviated flags are refused.",
+               "abbreviated flags are refused. -h or --help is read only "
+               "as the sole argument.",
     )
     ap.add_argument("path", nargs="?", help="the .sql file")
     ap.add_argument("--server", help="SQL Server host or host\\instance")
@@ -623,13 +628,16 @@ def _fail(code, message):
 
 def main(argv=None, connect=None):
     argv = sys.argv[1:] if argv is None else argv
+    # argparse would read -hFOO as -h and exit 0 with --apply on the line, so
+    # the help flags are matched here and nowhere else.
+    if argv in (["-h"], ["--help"]):
+        _parser().print_help()
+        return EXIT_OK
     try:
         args = _parser().parse_args(argv)
         _validate(args)
     except UsageError as exc:
         return _fail(EXIT_USAGE, exc)
-    except SystemExit:          # --help
-        return EXIT_OK
     if args.self_test:
         return self_test()
 
@@ -1233,7 +1241,10 @@ def self_test():
             ("EXEC(@sql)\nGO\n", "EXEC of a variable"),
             ("EXEC sp_executesql N'SELEC 1'\nGO\n", "sp_executesql"),
             ("EXEC sys.sp_executesql @s\nGO\n", "a schema-qualified sp_executesql"),
-            ("SELECT 1; EXEC('x')\nGO\n", "EXEC after another statement")):
+            ("SELECT 1; EXEC('x')\nGO\n", "EXEC after another statement"),
+            ("EXEC [sys].[sp_executesql] N'SELEC 1'\nGO\n", "a bracketed sp_executesql"),
+            ("EXEC [ sp_executesql ] N'SELEC 1'\nGO\n", "a bracketed sp_executesql with spaces"),
+            ("EXEC \"sys\".\"sp_executesql\" N'SELEC 1'\nGO\n", "a double-quoted sp_executesql")):
         b, p = split_script(text)
         check(b[0].dynamic and not p,
               "%s is flagged dynamic  <-- pinned defect" % label)
@@ -1242,7 +1253,7 @@ def self_test():
             ("EXEC dbo.proc1 @a = 1\nGO\n", "a stored procedure call"),
             ("EXECUTE AS USER = 'x'\nGO\n", "EXECUTE AS"),
             ("PRINT 'EXEC(x) sp_executesql'\nGO\n", "EXEC inside a literal"),
-            ("SELECT [sp_executesql]\nGO\n", "a bracketed name"),
+            ("SELECT 'x [sp_executesql] \"sp_executesql\"'\nGO\n", "a literal holding a name"),
             ("SELECT 1 -- EXEC('x')\nGO\n", "a comment"),
             ("SELECT EXECUTED FROM t\nGO\n", "a word that starts with EXEC")):
         check(not split_script(text)[0][0].dynamic,
@@ -1251,7 +1262,11 @@ def self_test():
             ("EXEC('SET NOEXEC ON')\nGO\n", "NOEXEC", "NOEXEC inside EXEC"),
             ("EXEC(N'SET NOCOUNT, FMTONLY ON')\nGO\n", "FMTONLY", "FMTONLY inside EXEC"),
             ("EXEC sp_executesql N'SET PARSEONLY OFF'\nGO\n", "PARSEONLY",
-             "PARSEONLY inside sp_executesql")):
+             "PARSEONLY inside sp_executesql"),
+            ("EXEC [sys].[sp_executesql] N'SET NOEXEC ON'\nGO\n", "NOEXEC",
+             "NOEXEC inside a bracketed sp_executesql"),
+            ("EXEC \"sys\".\"sp_executesql\" N'SET NOEXEC ON'\nGO\n", "NOEXEC",
+             "NOEXEC inside a double-quoted sp_executesql")):
         check(len(hits(text, word)) == 1,
               "%s is REFUSED  <-- pinned defect" % label)
 
@@ -1567,6 +1582,14 @@ def self_test():
               "a bad connection value is a usage error")
         code, out, err = run(["-h"])
         check(code == EXIT_OK and "--apply" in out, "--help prints the flags and exits 0")
+        code, out, err = run(["--help"])
+        check(code == EXIT_OK and "--apply" in out, "--help alone prints the flags and exits 0")
+        for argv in ([good, "-h", "myhost", "--database", "d", "--apply"],
+                     ["-hFOO"], ["--help", "--apply"], [good, "--split-only", "-h"]):
+            log, conns = [], []
+            code, out, err = run(argv, _fake_connect(log, conns))
+            check(code == EXIT_USAGE and not conns and not log and "usage:" not in out,
+                  "-h next to other arguments is a usage error, never exit 0  <-- pinned defect")
 
         code, out, err = run([good, "--split-only"])
         check(code == EXIT_OK and "2 batch(es)" in out and "SPLIT ONLY" in out,

@@ -23,7 +23,8 @@ trusts neither.
 - A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_*` or `IMPLICIT_TRANSACTIONS` is an error. Those
   settings make later batches stop running while the server still says OK. So is the same setting inside
   an `EXEC('...')` string.
-- A batch that runs `EXEC('...')`, `EXEC (@sql)` or `sp_executesql` is an error unless you pass
+- A batch that runs `EXEC('...')`, `EXEC (@sql)` or `sp_executesql`, also written `[sys].[sp_executesql]`
+  or `"sp_executesql"`, is an error unless you pass
   `--allow-dynamic`. `SET PARSEONLY` does not read the text inside, so a typo there would pass the
   check and fail during `--apply`. With the flag, the verdict line says the text was not parsed.
 - The text of a string literal, and a hex literal of four bytes or more such as a `HASHED` password
@@ -85,14 +86,17 @@ PASS  a padded literal echoed with its apostrophe undoubled is masked whole  <--
 PASS  a driver error (sqlstate, message) is masked from the message, not its tuple repr  <-- pinned defect
 ...
 PASS  an unknown flag is named but its value is not echoed  <-- pinned defect
+PASS  -h next to other arguments is a usage error, never exit 0  <-- pinned defect
 ...
 PASS  --apply with one unparseable batch runs NOTHING  <-- pinned defect
 PASS  --apply of a script with EXEC text is REFUSED before any connection  <-- pinned defect
 PASS  --allow-dynamic checks, and the verdict says the EXEC text was not parsed  <-- pinned defect
 PASS  SET NOEXEC inside an EXEC string is REFUSED, even with --split-only  <-- pinned defect
+PASS  a bracketed sp_executesql is flagged dynamic  <-- pinned defect
+PASS  NOEXEC inside a double-quoted sp_executesql is REFUSED  <-- pinned defect
 ...
 --------------------------------------------------------------------
-305 assertions, 0 failed
+315 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -209,6 +213,7 @@ Pages cited:
 - <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/sql-server-utilities-statements-go>
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-parseonly-transact-sql>
 - <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/slash-star-comment-transact-sql>
+- <https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql> (`EXEC ( { @string_variable | [ N ]'tsql_string' } )` runs a character string.)
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-noexec-transact-sql>
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-showplan-all-transact-sql> (The page names `SHOWPLAN_TEXT` as its sibling. I did not read the `SHOWPLAN_TEXT` or `SHOWPLAN_XML` pages, so those two rest on the sibling relation.)
 - <https://learn.microsoft.com/en-us/sql/t-sql/statements/set-fmtonly-transact-sql>
@@ -372,8 +377,8 @@ nothing was sent to any server.
 | A lone CR ends a `--` comment; bracketed and double-quoted names hide `--`, `/*`, `'` and `GO`; a stacked `SET NOEXEC ON` or `BEGIN TRAN` after them is seen | `--self-test`: the lexer section, the cases marked `pinned defect` among them |
 | An open transaction at the end is not reported OK | `--self-test`: a fake cursor counts `BEGIN TRAN` and `COMMIT`; an uncommitted script exits 2, a committed one exits 0, and a failing count query exits 2 |
 | A duplicate key value in parentheses is masked, with or without a literal in the batch | `--self-test`: a fake server message in the Msg 2627 shape, for a batch with a literal and for an `INSERT ... SELECT` with none |
-| A batch with EXEC text is refused without `--allow-dynamic`, flagged in `--split-only`, and a refused `SET` inside the string is refused | `--self-test`: eight forms that count as dynamic and seven that do not, three refused settings inside strings, and the check and `--apply` runs through `main()` with a fake connection. The `dyn.sql` run above is real. |
-| A `$(Name)` reference is refused | `--self-test`: one in a bracketed name, one in a string, and three texts that are not references. The `var.sql` run above is real. |
+| A batch with EXEC text is refused without `--allow-dynamic`, flagged in `--split-only`, and a refused `SET` inside the string is refused | `--self-test`: eleven forms that count as dynamic and seven that do not, five refused settings inside strings, and the check and `--apply` runs through `main()` with a fake connection. The `dyn.sql` run above is real. |
+| A `$(Name)` reference is refused | `--self-test`: one in a bracketed name, one in a string, and four texts that are not references. The `var.sql` run above is real. |
 
 The self-test writes small files in directories named `sqldeploy-test-*` under the system temp
 directory, and removes them. Nothing else in the tool writes a file. Only `--apply` writes to a server.
@@ -388,13 +393,30 @@ name, the driver name not validated, literal masking removed, an unknown flag va
 transaction note removed, the GO cap removed, the NUL check removed, and Ctrl+C not caught. You cannot
 reproduce the run from this repo alone.
 
-That run was made before the lexer work (lone CR, bracketed and double-quoted names) and before the
-open-transaction check, so it does not cover them. For those I made five single edits by hand and ran the
-self-test after each: `_LINE_RE` that ignores a lone CR (10 assertions failed), no `]]` escape (2 failed),
-`--` no longer starting a comment (23 failed), `[` no longer opening a name (14 failed), and the
-open-transaction branch removed (1 failed). A sixth edit removed the duplicate-key mask (2 failed). A seventh edit stopped the same-line `GO` check from walking a line that starts inside a quote (6 assertions failed). Three more edits cover the EXEC rule: a dynamic test that never matches (16 failed), the settings scan that does not read literals (4 failed), and the refusal removed (2 failed).
+That run was made before the lexer work (lone CR, bracketed and double-quoted names), before the
+open-transaction check and before the dynamic-SQL rule, so it does not cover them. For those I made
+twelve single edits by hand to a copy and ran the self-test after each. It reported 315 assertions each
+time. The edit is the change named, and the count is how many assertions failed:
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1133 statements, 284
+| Edit | Failed |
+|---|---|
+| `_LINE_RE` rewritten so that only LF ends a line, not a lone CR | 10 |
+| the `]]` test in `_scan_line` replaced by `False` | 2 |
+| `elif two == "--":` replaced by `elif False:` | 24 |
+| `if c in "'\"[":` without the `[`, first occurrence, in `_scan_line` | 5 |
+| the `BEGIN TRAN` flag passed as `False` | 6 |
+| the duplicate-key mask line replaced by `text = text` | 2 |
+| the same-line `GO` check run on `visible` without the open quote | 9 |
+| `dynamic = False` | 21 |
+| the settings scan reading `code` and never the literals | 6 |
+| the dynamic refusal in `main()` replaced by `if False:` | 2 |
+| `_code_and_strings` blanking bracketed and double-quoted names again | 4 |
+| the `-h` test in `main()` replaced by `if False:` | 2 |
+
+The harness for these twelve is not shipped either. Each row is one text replacement, so you can apply
+it by hand and run `--self-test`.
+
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1140 statements, 288
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -427,7 +449,9 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   The message names the batches that hold the statement and says the commit count may be too high.
   After a clean run, `--apply` asks the server for `@@TRANCOUNT` and exits 2 if it is above 0. The
   count query itself ran only against the fake cursor. A transaction opened inside an `EXEC` string is
-  counted by the server, so it is caught here too.
+  counted by the server, so it is caught here too. The failure message does not name such a batch, so it
+  can say that earlier batches are committed when the disconnect discards the open transaction. I did not
+  check this against a real server.
 - **An error that the driver reports only while rows stream may not be seen.** `--apply` drains each
   batch with `nextset()`. A real server could raise a late error in a way that call does not surface,
   and the run would then print `DEPLOY OK`. A fake cursor cannot show this either way.
@@ -435,7 +459,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   not say how many batches ran. An error while closing the connection prints a warning on stderr. The
   exit status then reflects the deploy, not the close.
 - **The scan for refused `SET` options reads the script text.** In a batch with `EXEC` text it also
-  reads the string literals. `EXEC('SET PARSE' + 'ONLY OFF')` and other text built at run time is not
+  reads the string literals and the bracketed and double-quoted names, so `SELECT 1 AS [SET NOEXEC ON]`
+  next to an `EXEC('x')` is refused. That is a safe false refusal. `EXEC('SET PARSE' + 'ONLY OFF')` and other text built at run time is not
   seen, and `--allow-dynamic` accepts that.
 - **`GO` inside a comment, string or bracketed name is refused.** A script that needs it must change.
   `GO /* note */` is also refused. A count above 10000 is refused.
@@ -444,7 +469,9 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   files. A BOM in the middle of a file, left by joining files, is not removed. A BOM at the start of a `GO` line
   is not seen as `GO`, and the tool refuses the script with "GO follows code", so it does not split
   there. That is the safe direction, not a silent miss.
-- **Python decides what counts as whitespace.** A non-breaking space after `GO` is read as a space, and
+- **Python decides what counts as whitespace.** A line that holds a non-breaking space, U+2028, U+0085, a
+  vertical tab or a form feed before `GO` is read as a `GO` line, because Python counts them as
+  whitespace. `sqlcmd` may not. A non-breaking space after `GO` is read as a space, and
   a batch of only Unicode whitespace counts as empty. `sqlcmd` may read them differently. Non-ASCII
   digits after `GO` are refused as malformed.
 - **sqlcmd features are not run.** `:r`, `:setvar` and `$(var)` are not expanded. A line that starts
@@ -506,8 +533,10 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **Text inside `EXEC` and `sp_executesql` strings is never parsed.** A batch that runs it is refused
   unless you pass `--allow-dynamic`. With the flag, a syntax error in the string still gives a clean
   check, and the line says `(dynamic SQL text not parsed)`. A literal `SET NOEXEC ON` inside the string
-  is refused. Text built from variables or `+` is not seen. A `sp_executesql` written as a bracketed
-  name, `[sp_executesql]`, is not flagged. A procedure name in a variable, `EXEC @proc`, is not flagged.
+  is refused. Text built from variables or `+` is not seen. A `sp_executesql` written as `[sp_executesql]`
+  or `"sp_executesql"` is flagged like the bare word, and so is a name that only holds the word, such as
+  `[my sp_executesql]`. That false refusal is the safe direction. A procedure name in a variable,
+  `EXEC @proc`, is not flagged.
   A stored procedure call such as `EXEC dbo.proc1` is not flagged either, and the procedure body is not
   read. I did not check whether a `SET` inside the string stays in effect after the `EXEC` returns.
 - **`SET STATISTICS PARSE` is not in the refused list.** I did not check its semantics.
@@ -516,8 +545,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **A line that starts with the word `go` inside an open comment or string is refused.** Prose such as
   `go live Monday` on its own line in a block comment or a multi-line literal is read as a `GO` line.
   This is a safe false refusal and exits 1. I ran it.
-- **`-hSOMETHING` prints help and exits 0.** argparse reads a short flag glued to `-h` as `-h`, so the
-  tool does not refuse it as an unknown argument. I ran `-hFOO`. Nothing is sent to a server.
+- **`-h` and `--help` print help only as the sole argument.** With any other argument, including `-hFOO`,
+  the tool exits 64 and sends nothing. A script that wants help next to other flags must drop them.
 - **A `GO` count of ten or more digits is refused even when its value is small.** `GO 0000000001` exits
   1 with the count message, because the check uses the digit count.
 - **A driver error is read as `(sqlstate, message)`.** When the exception has two arguments and the second
@@ -555,10 +584,9 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   flags next to it, but an unknown flag or a flag without its value is refused first (exit 64).
   `--split-only` ignores `--odbc-driver` and `--trust-server-certificate`.
 - **One pragma.** 100 percent branch coverage depends on `# pragma: no branch` on the `__main__` guard.
-- **The mutation harness is not shipped.** The mutation result above cannot be reproduced from this repo.
-  The counts are a record of earlier self-test versions: the `--` edit failed 21 assertions then and 23
-  now, and the `[` edit failed 13 then and 14 now. The 143-edit figure cannot be checked from here. Only
-  the six hand edits can be rerun.
+- **The mutation harness is not shipped.** The 143-edit figure cannot be checked from here. The twelve
+  hand edits in the table above can be rerun, and their counts hold for this version of the self-test. A
+  count can change by one or more when the self-test gains an assertion.
 - **Only the listed statements are flagged as stacked.** The tool finds `SET NOEXEC`, `FMTONLY`,
   `SHOWPLAN_*`, `IMPLICIT_TRANSACTIONS`, `PARSEONLY`, `BEGIN TRAN`, sqlcmd directives and `$(var)`, also
   after a bracketed name, a quoted name or a lone-CR comment. It does not flag any other second
@@ -568,7 +596,8 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   long-literal ones above.
 - **A secret written without quotes is not a literal.** If the script has `PASSWORD = Sup3rS3cret` and
   the server error repeats it, the tool prints it as the server sent it, because it masks only quoted
-  text and long hex.
+  text and long hex. A secret written without quotes is shown in the batch summary too, not only in the
+  server message.
 - **Exit 64 covers two things.** A bad command line and a script file that cannot be read both exit 64.
 - **I did not test pooled ODBC connections.** If `SET PARSEONLY OFF` failed after a batch error, a pooled
   connection could keep `PARSEONLY ON`. `--apply` uses a second connection, and the driver normally
