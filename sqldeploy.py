@@ -63,12 +63,11 @@ Batch = collections.namedtuple(
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+")
 # GO as a word at the start of a line. GOTO, GO_1 and GO5 are not GO.
 _GO_RE = re.compile(r"^\s*GO(?![\w@#$])(.*)$", re.IGNORECASE)
-# GO as the last word of a line that holds other code or a leading comment.
-# One trailing semicolon is allowed, so "SELECT 1 GO;" is seen too.
+# GO as a word anywhere after code or a leading comment on a line, so both
+# "SELECT 1 GO;" and "SELECT 1 GO DROP TABLE t" are seen.
 # Run on comment-free, literal-free text. Dots and brackets before GO mean a
 # name (dbo.go), so they do not match.
-_GO_AFTER_RE = re.compile(r"(?<![\w@#$.\]])GO(?![\w@#$])(?:\s+[0-9]+)?\s*;?\s*$",
-                          re.IGNORECASE)
+_GO_AFTER_RE = re.compile(r"(?<![\w@#$.\]])GO(?![\w@#$])", re.IGNORECASE)
 _GO_TAIL_RE = re.compile(r"^(?:\s+([0-9]+))?\s*(?:--.*)?$")
 _PARSEONLY_RE = re.compile(r"\bPARSEONLY\b", re.IGNORECASE)
 # Settings that stop later batches from running while the server still says OK.
@@ -645,8 +644,10 @@ def main(argv=None, connect=None):
         with open(args.path, "rb") as handle:
             text = decode_sql(handle.read())
     except (OSError, ValueError) as exc:
-        return _fail(EXIT_USAGE, "cannot read %s: %s" % (
-            ascii_safe(args.path), one_line(exc, DETAIL_WIDTH)))
+        hint = ("; save the file as UTF-8 and run again"
+                if isinstance(exc, UnicodeDecodeError) else "")
+        return _fail(EXIT_USAGE, "cannot read %s: %s%s" % (
+            ascii_safe(args.path), one_line(exc, DETAIL_WIDTH), hint))
 
     batches, problems = split_script(text)
     runnable = [b for b in batches if not b.empty]
@@ -999,6 +1000,16 @@ def self_test():
     b, p = split_script("SELECT 1 GO 2;\nSELECT 2\nGO\n")
     check(len(p) == 1 and p[0][0] == 1 and "GO follows code" in p[0][1],
           "GO with a count and a semicolon after code is REFUSED  <-- pinned defect")
+    for case, mid in enumerate(("SELECT x FROM dbo.t GO DROP TABLE dbo.victim\n",
+                "SELECT 1 GO SELECT 2\n",
+                "SELECT 1 /* c */ GO DROP TABLE dbo.victim\n",
+                "SELECT 1; GO SELECT 2\n"), 1):
+        b, p = split_script(mid)
+        check(len(p) == 1 and p[0][0] == 1 and "GO follows code" in p[0][1],
+              "GO in the middle of a line before more code is REFUSED, case %d  <-- pinned defect"
+              % case)
+    b, p = split_script("SELECT 1 FROM dbo.go_t, dbo.go\nSELECT [go] FROM t\n")
+    check(len(b) == 1 and not p, "dbo.go and [go] mid-line are not GO")
     b, p = split_script("SELECT 1 /* c */ GO\nDROP TABLE dbo.victim\nGO\n")
     check(len(p) == 1 and p[0][0] == 1,
           "GO after a block comment on a code line is REFUSED  <-- pinned defect")
@@ -1746,6 +1757,12 @@ def self_test():
         check(code == EXIT_USAGE and "cannot read" in err, "a file that is not text exits 64")
         code, out, err = run([os.path.join(tmp, "missing.sql"), "--split-only"])
         check(code == EXIT_USAGE and "cannot read" in err, "a missing file exits 64")
+        legacy = write("legacy.sql", b"SELECT '\xe9'\nGO\n")
+        code, out, err = run([legacy, "--split-only"])
+        check(code == EXIT_USAGE and "save the file as UTF-8" in err,
+              "a legacy-encoded script exits 64 and says to save it as UTF-8")
+        check("save the file as UTF-8" not in run([os.path.join(tmp, "missing.sql"), "--split-only"])[2],
+              "a missing file gets no encoding hint")
 
         code, out, err = run([good] + server, _fake_connect([], [], fail_connect=True))
         check(code == EXIT_CONNECT and "no batch was run" in err,

@@ -75,6 +75,7 @@ PASS  each batch records its own line range
 PASS  a GO line inside a block comment is REFUSED  <-- pinned defect
 PASS  GO after a statement on the same line is REFUSED, not run as text  <-- pinned defect
 PASS  GO followed by a semicolon after code on the same line is REFUSED  <-- pinned defect
+PASS  GO in the middle of a line before more code is REFUSED, case 1  <-- pinned defect
 PASS  GO after a multi-line single-quoted literal closes on its line is REFUSED  <-- pinned defect
 ...
 PASS  a prefix --app of --apply is REFUSED before any connection  <-- pinned defect
@@ -96,7 +97,7 @@ PASS  a bracketed sp_executesql is flagged dynamic  <-- pinned defect
 PASS  NOEXEC inside a double-quoted sp_executesql is REFUSED  <-- pinned defect
 ...
 --------------------------------------------------------------------
-315 assertions, 0 failed
+322 assertions, 0 failed
 ```
 
 The count is the same on Windows (Python 3.13.2), Linux (Python 3.12.3) and Linux (Python 3.9.25).
@@ -190,7 +191,7 @@ The rules, with the source of each:
 | `GO;` is refused. | The GO page: "Do not use a semicolon as a statement terminator after GO." |
 | The tool strips `GO` and sends each batch alone. | The GO page: "Applications based on the ODBC or OLE DB APIs receive a syntax error if they try to execute a GO command." |
 | Block comments nest. `/*` inside a comment opens a second level. | The block-comment page: "Nested comments are supported." |
-| A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that ends a line of code or follows a comment on its line, such as `SELECT 1 /* a */ GO` or `SELECT 1 GO;`. The same holds when the line starts inside a multi-line string, double-quoted name or bracketed name and the closing quote comes before the `GO`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
+| A `GO` line inside an open comment, string or bracketed name is refused. So is a `GO` that follows code or a comment on its line, at the end or in the middle, such as `SELECT 1 /* a */ GO`, `SELECT 1 GO;` or `SELECT 1 GO DROP TABLE t`. The same holds when the line starts inside a multi-line string, double-quoted name or bracketed name and the closing quote comes before the `GO`. | For the open-comment case the GO page does not say how the utilities treat it, so the tool refuses instead of guessing. For the same-line case the GO page says a statement cannot occupy the same line as `GO`. |
 | A script that sets or names `PARSEONLY` in code is refused. A mention inside a comment or a string is not. | The PARSEONLY page: "The setting of SET PARSEONLY is set at parse time and not at execute or run time." I could not test a real server. A script that sets it could change the mode the preview relies on. |
 | A script that sets `NOEXEC`, `FMTONLY`, `SHOWPLAN_ALL`, `SHOWPLAN_TEXT`, `SHOWPLAN_XML` or `IMPLICIT_TRANSACTIONS` is refused. | The NOEXEC page: SQL Server "parses and compiles each batch of Transact-SQL statements but does not execute them". The SHOWPLAN_ALL page: "Transact-SQL statements are not executed". The FMTONLY page: a rowset comes back "without any data rows". The IMPLICIT_TRANSACTIONS page: a statement starts a transaction that you must end with `COMMIT` or `ROLLBACK`. After any of these a deploy could print `DEPLOY OK` and have changed nothing. |
 | A batch with `EXEC` followed by a parenthesis or a string, or with `sp_executesql`, is refused unless `--allow-dynamic` is given. A refused `SET` option or `PARSEONLY` inside such a batch's strings is refused too. | The PARSEONLY page says SQL Server "only parses the statement". The EXECUTE page documents `EXEC ( { @string_variable | [ N ]'tsql_string' } )` as a statement that runs a character string. Neither page says the string is parsed under PARSEONLY, so the tool does not assume it. |
@@ -398,7 +399,7 @@ reproduce the run from this repo alone.
 
 That run was made before the lexer work (lone CR, bracketed and double-quoted names), before the
 open-transaction check and before the dynamic-SQL rule, so it does not cover them. For those I made
-twelve single edits by hand to a copy and ran the self-test after each. It reported 315 assertions each
+twelve single edits by hand to a copy and ran the self-test after each. It reported 322 assertions each
 time. The edit is the change named, and the count is how many assertions failed:
 
 | Edit | Failed |
@@ -419,7 +420,7 @@ time. The edit is the change named, and the count is how many assertions failed:
 The harness for these twelve is not shipped either. Each row is one text replacement, so you can apply
 it by hand and run `--self-test`.
 
-Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1140 statements, 288
+Coverage: `coverage run --branch sqldeploy.py --self-test` reports 100 percent (1150 statements, 290
 branches). One line carries a pragma: `if __name__ == "__main__":  # pragma: no branch`. The false side
 of that test runs only on import, and the self-test runs the file as a script.
 
@@ -468,7 +469,7 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
 - **`GO` inside a comment, string or bracketed name is refused.** A script that needs it must change.
   `GO /* note */` is also refused. A count above 10000 is refused.
 - **Encodings.** Scripts must be UTF-8, UTF-8 with BOM, or UTF-16 with BOM. A legacy code page such as
-  cp1252 exits 64. A NUL character is refused, which also catches UTF-16 without a BOM and most UTF-32
+  cp1252 exits 64 and the message says to save the file as UTF-8. A NUL character is refused, which also catches UTF-16 without a BOM and most UTF-32
   files. A BOM in the middle of a file, left by joining files, is not removed. A BOM at the start of a `GO` line
   is not seen as `GO`, and the tool refuses the script with "GO follows code", so it does not split
   there. That is the safe direction, not a silent miss.
@@ -524,12 +525,14 @@ Linters: `pyflakes` reports nothing. `python -W error` compiles the file without
   (U+2028, U+2029, U+0085), vertical tab and form feed do not end it here. SQL Server, `sqlcmd` or SSMS
   may treat them differently. I did not test that. If one does, a `SET NOEXEC ON` after such a character
   is hidden from the scan.
+- **A line feed followed by a carriage return counts as two line breaks in reported line numbers.** A file that uses that rare ending reports line numbers one too high on each such line.
+- **A `USE` statement in the script can send later batches to a database other than `--database`.** The tool does not check or warn.
 - **A lone CR counts as a line break in reported line numbers.** In a file that uses CR alone, each CR
   adds one to the line number. SSMS may count lines differently for such a file.
 - **A double-quoted name is a string literal when `QUOTED_IDENTIFIER` is OFF.** The identifiers page says
   so. The tool treats double-quoted text as masked either way in the batch summary. That is the safe
   direction. A server message that repeats double-quoted text is not masked.
-- **A line of code that ends in the word `go` is refused.** `SELECT 1 /* a */ GO` and `SELECT 1 GO;` are refused because
+- **A line of code that holds the word `go` is refused.** `SELECT 1 /* a */ GO`, `SELECT 1 GO;` and `SELECT 1 GO SELECT 2` are refused because
   the GO page says a statement cannot share a line with `GO`. `SELECT x AS go` and `FROM t go` (an alias) are
   refused too, which is a false refusal in the safe direction. `dbo.go`, `[go]` and `go` inside a
   literal are not refused.
